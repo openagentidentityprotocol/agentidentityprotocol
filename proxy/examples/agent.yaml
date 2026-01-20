@@ -29,6 +29,39 @@ spec:
   #   - Gradual policy rollout
   mode: enforce
 
+  # ============================================================================
+  # METHOD ALLOWLIST (First Line of Defense)
+  # ============================================================================
+  #
+  # Control which JSON-RPC methods are permitted. This is checked BEFORE
+  # tool-level policy, preventing bypass attacks via methods like resources/read.
+  #
+  # If omitted, only safe default methods are allowed:
+  #   - tools/call, tools/list (subject to tool policy)
+  #   - initialize, initialized, ping (MCP handshake)
+  #   - completion/complete, notifications/*
+  #
+  # SECURITY: The following are BLOCKED by default:
+  #   - resources/read, resources/list (can read arbitrary files!)
+  #   - prompts/get, prompts/list (can access prompt templates)
+  #
+  # Uncomment below to explicitly allow additional methods:
+  #
+  # allowed_methods:
+  #   - tools/call
+  #   - tools/list
+  #   - resources/read    # ⚠️  DANGEROUS: Only enable if you understand the risk
+  #   - prompts/list
+  #
+  # To block specific methods (takes precedence over allowed):
+  # denied_methods:
+  #   - resources/write
+  #   - logging/setLevel
+
+  # ============================================================================
+  # TOOL ALLOWLIST
+  # ============================================================================
+  #
   # Tools that this agent is allowed to invoke.
   # Any tool not in this list will be blocked with a -32001 Forbidden error.
   #
@@ -59,10 +92,48 @@ spec:
     # - slack_post_message      # External communication
     # - exec_command            # Arbitrary code execution
 
-  # Tool Rules: Fine-grained control per tool
+  # ============================================================================
+  # PROTECTED PATHS (Policy Self-Modification Defense)
+  # ============================================================================
+  #
+  # Paths that tools may not read, write, or modify.
+  # Any tool argument containing a protected path will be BLOCKED.
+  #
+  # The policy file itself is ALWAYS protected (added automatically).
+  # Add additional sensitive paths here:
+  #
+  protected_paths:
+    - ~/.ssh                    # SSH keys
+    - ~/.aws/credentials        # AWS credentials
+    - ~/.config/gcloud          # GCP credentials
+    - .env                      # Environment variables
+    - .env.local                # Local environment
+    # Note: The policy file (this file) is automatically protected
+
+  # ============================================================================
+  # STRICT ARGS MODE (Global Default)
+  # ============================================================================
+  #
+  # When strict_args_default is true, tools reject any arguments not declared
+  # in their allow_args. This prevents exfiltration attacks via extra args.
+  #
+  # Example attack prevented:
+  #   Policy validates: url: "^https://github.com/.*"
+  #   Attacker sends:   {"url": "https://github.com/ok", "headers": {"X-Exfil": "secret"}}
+  #   Without strict:   headers passes through unchecked (BAD!)
+  #   With strict:      BLOCKED - "headers" not in allow_args (GOOD!)
+  #
+  # strict_args_default: false  # Uncomment to enable globally
+  #
+  # Individual tools can override with strict_args: true/false
+
+  # ============================================================================
+  # TOOL RULES
+  # ============================================================================
   #
   # Each rule can specify:
   #   - action: "allow" (default), "block", or "ask"
+  #   - strict_args: true/false (override global default)
   #   - allow_args: Regex patterns for argument validation
   #
   # Action types:
@@ -90,6 +161,17 @@ spec:
       allow_args:
         query: "^SELECT\\s+.*"
 
+    # Example: High-security API with strict argument validation
+    # Only declared arguments are allowed; extra args are blocked
+    - tool: http_request
+      strict_args: true
+      allow_args:
+        url: "^https://api\\.github\\.com/.*"
+        method: "^(GET|POST)$"
+      # With strict_args: true, these would be BLOCKED:
+      #   {"url": "...", "method": "GET", "headers": {...}}  ← headers not declared
+      #   {"url": "...", "method": "GET", "body": "..."}     ← body not declared
+
     # Example: Explicitly block destructive operations
     - tool: github_delete_repo
       action: block
@@ -107,8 +189,18 @@ spec:
   #   [REDACTED:<RuleName>]
   #
   # Each redaction is logged to the audit trail as a DLP_TRIGGERED event.
+  #
+  # ENCODING DETECTION:
+  #   detect_encoding: true enables scanning of base64/hex encoded strings.
+  #   This catches bypass attacks where secrets are encoded to evade patterns:
+  #     Original:  AKIAIOSFODNN7EXAMPLE
+  #     Base64:    QUtJQUlPU0ZPRE5ON0VYQU1QTEU=
+  #     Hex:       414b4941494f53464f444e4e374558414d504c45
+  #   Without detection, encoded forms would pass through undetected.
   dlp:
     # enabled: true  # Default is true when dlp block is present
+    detect_encoding: true  # Decode base64/hex before scanning (recommended)
+    filter_stderr: true    # Apply DLP to subprocess error logs (recommended)
     patterns:
       # Email addresses (PII)
       - name: "Email"

@@ -1,0 +1,102 @@
+# Docker Container MCP Server Policy Example
+#
+# This example shows how to properly wrap a Dockerized MCP server with AIP.
+#
+# IMPORTANT: Signal Propagation
+# =============================
+# When AIP is terminated (SIGTERM/SIGINT), it sends SIGTERM to the subprocess.
+# For Docker containers to properly receive this signal:
+#
+#   1. Use --rm flag: Container is removed when it exits
+#   2. Use --init flag: Proper signal handling inside container
+#   3. Use -i flag: Keep stdin open for JSON-RPC communication
+#
+# Example command:
+#   aip --policy docker-wrapper.yaml \
+#       --target "docker run --rm --init -i mcp/filesystem:latest"
+#
+# Without these flags, stopping AIP may leave orphaned containers running!
+#
+# To verify cleanup works:
+#   1. Start AIP with the target Docker container
+#   2. Run: docker ps  (note container ID)
+#   3. Press Ctrl+C to stop AIP
+#   4. Run: docker ps  (container should be gone)
+#
+# If the container persists, manually clean up with:
+#   docker stop <container_id> && docker rm <container_id>
+
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+
+metadata:
+  name: docker-mcp-server
+  version: "1.0.0"
+  owner: platform-team@company.com
+
+spec:
+  mode: enforce
+
+  # Container-specific tool allowlist
+  # Adjust based on what your MCP server provides
+  allowed_tools:
+    # Filesystem tools (if using mcp/filesystem image)
+    - read_file
+    - list_directory
+    - get_file_info
+    
+    # Database tools (if using a DB MCP server)
+    # - query
+    # - list_tables
+    
+    # Custom container tools
+    # - your_custom_tool
+
+  # Protected paths - prevent container escape attempts
+  protected_paths:
+    # Host paths that might be mounted
+    - /etc/passwd
+    - /etc/shadow
+    - /root
+    - ~/.ssh
+    - ~/.aws
+    # Container-specific paths
+    - /proc
+    - /sys
+    - /.dockerenv
+
+  tool_rules:
+    # Require approval for any write operations
+    - tool: write_file
+      action: ask
+      allow_args:
+        path: "^/workspace/.*"  # Only allow writes to workspace
+
+    # Block potentially dangerous operations
+    - tool: execute_command
+      action: block
+
+    - tool: shell_exec
+      action: block
+
+    # Rate limit expensive operations
+    - tool: query
+      rate_limit: "10/minute"
+
+  # DLP: Prevent secrets from leaking through container logs
+  dlp:
+    enabled: true
+    detect_encoding: true
+    filter_stderr: true  # Important for Docker - catches container errors
+    patterns:
+      - name: "Docker Secret"
+        regex: "DOCKER_.*=.*"
+      
+      - name: "AWS Key"
+        regex: "(A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}"
+      
+      - name: "Generic Secret"
+        regex: "(?i)(password|secret|token|api_key)\\s*[:=]\\s*['\"]?[^\\s'\"]+['\"]?"
+      
+      - name: "Private Key"
+        regex: "-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"

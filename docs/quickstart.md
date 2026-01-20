@@ -4,7 +4,7 @@ This guide walks through a minimal test demonstrating the AIP proxy's policy enf
 
 ## Prerequisites
 
-- Go 1.25+
+- Go 1.23+
 - Python 3.x
 
 ## What We're Building

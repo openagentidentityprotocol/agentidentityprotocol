@@ -17,8 +17,11 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 
+	"golang.org/x/time/rate"
 	"gopkg.in/yaml.v3"
 )
 
@@ -113,6 +116,8 @@ type PolicySpec struct {
 //	      query: "^SELECT\\s+.*"
 //	  - tool: dangerous_tool
 //	    action: ask
+//	  - tool: expensive_api_call
+//	    rate_limit: "5/minute"
 type ToolRule struct {
 	// Tool is the name of the tool this rule applies to.
 	Tool string `yaml:"tool"`
@@ -124,6 +129,12 @@ type ToolRule struct {
 	// - "ask": Prompt user via native OS dialog for approval
 	Action string `yaml:"action,omitempty"`
 
+	// RateLimit specifies the maximum call rate for this tool.
+	// Format: "N/duration" where duration is "second", "minute", or "hour".
+	// Examples: "5/minute", "100/hour", "10/second"
+	// If empty, no rate limiting is applied.
+	RateLimit string `yaml:"rate_limit,omitempty"`
+
 	// AllowArgs maps argument names to regex patterns.
 	// Each argument value must match its corresponding regex.
 	// Key = argument name, Value = regex pattern string.
@@ -132,6 +143,56 @@ type ToolRule struct {
 	// compiledArgs holds pre-compiled regex patterns for performance.
 	// Populated during Load() to avoid recompilation on every request.
 	compiledArgs map[string]*regexp.Regexp
+
+	// parsedRateLimit holds the parsed rate limit value (requests per second).
+	// Zero means no rate limiting.
+	parsedRateLimit rate.Limit
+
+	// parsedBurst holds the burst size for rate limiting.
+	// Defaults to the rate limit count (N in "N/duration").
+	parsedBurst int
+}
+
+// ParseRateLimit parses a rate limit string like "5/minute" into rate.Limit and burst.
+// Returns (0, 0, nil) if the input is empty (no rate limiting).
+// Returns error if the format is invalid.
+//
+// Supported formats:
+//   - "N/second" - N requests per second
+//   - "N/minute" - N requests per minute
+//   - "N/hour"   - N requests per hour
+func ParseRateLimit(s string) (rate.Limit, int, error) {
+	if s == "" {
+		return 0, 0, nil // No rate limiting
+	}
+
+	s = strings.TrimSpace(s)
+	parts := strings.Split(s, "/")
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("invalid rate limit format %q: expected 'N/duration'", s)
+	}
+
+	count, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil || count <= 0 {
+		return 0, 0, fmt.Errorf("invalid rate limit count %q: must be positive integer", parts[0])
+	}
+
+	duration := strings.ToLower(strings.TrimSpace(parts[1]))
+	var perSecond float64
+
+	switch duration {
+	case "second", "sec", "s":
+		perSecond = float64(count)
+	case "minute", "min", "m":
+		perSecond = float64(count) / 60.0
+	case "hour", "hr", "h":
+		perSecond = float64(count) / 3600.0
+	default:
+		return 0, 0, fmt.Errorf("invalid rate limit duration %q: must be 'second', 'minute', or 'hour'", duration)
+	}
+
+	// Burst is set to the count to allow the full quota to be used in a burst
+	return rate.Limit(perSecond), count, nil
 }
 
 // -----------------------------------------------------------------------------
@@ -154,6 +215,8 @@ const (
 	ActionBlock = "block"
 	// ActionAsk prompts the user for approval via native OS dialog.
 	ActionAsk = "ask"
+	// ActionRateLimited indicates the call was blocked due to rate limiting.
+	ActionRateLimited = "rate_limited"
 )
 
 // Engine evaluates tool calls against the loaded policy.
@@ -163,6 +226,7 @@ const (
 //
 // Thread-safety: The engine is safe for concurrent use after initialization.
 // The allowedSet and toolRules maps are read-only after Load().
+// The limiters map is thread-safe via its own internal mutex.
 type Engine struct {
 	// policy holds the parsed agent.yaml configuration.
 	policy *AgentPolicy
@@ -178,6 +242,14 @@ type Engine struct {
 	// mode controls enforcement behavior: "enforce" (default) or "monitor".
 	// In monitor mode, violations are logged but allowed through.
 	mode string
+
+	// limiters holds per-tool rate limiters.
+	// Key = normalized tool name, Value = token bucket limiter.
+	// Populated during Load() for tools with rate_limit defined.
+	limiters map[string]*rate.Limiter
+
+	// limiterMu protects concurrent access to limiters map.
+	limiterMu sync.RWMutex
 }
 
 // NewEngine creates a new policy engine instance.
@@ -187,6 +259,7 @@ func NewEngine() *Engine {
 	return &Engine{
 		allowedSet: make(map[string]struct{}),
 		toolRules:  make(map[string]*ToolRule),
+		limiters:   make(map[string]*rate.Limiter),
 	}
 }
 
@@ -222,8 +295,9 @@ func (e *Engine) Load(data []byte) error {
 		e.allowedSet[normalized] = struct{}{}
 	}
 
-	// Compile tool rules with regex patterns
+	// Compile tool rules with regex patterns and initialize rate limiters
 	e.toolRules = make(map[string]*ToolRule, len(policy.Spec.ToolRules))
+	e.limiters = make(map[string]*rate.Limiter)
 	for i := range policy.Spec.ToolRules {
 		rule := &policy.Spec.ToolRules[i]
 		normalized := strings.ToLower(strings.TrimSpace(rule.Tool))
@@ -235,6 +309,18 @@ func (e *Engine) Load(data []byte) error {
 		}
 		if rule.Action != ActionAllow && rule.Action != ActionBlock && rule.Action != ActionAsk {
 			return fmt.Errorf("invalid action %q for tool %q, must be 'allow', 'block', or 'ask'", rule.Action, rule.Tool)
+		}
+
+		// Parse rate limit if specified
+		if rule.RateLimit != "" {
+			limit, burst, err := ParseRateLimit(rule.RateLimit)
+			if err != nil {
+				return fmt.Errorf("invalid rate_limit for tool %q: %w", rule.Tool, err)
+			}
+			rule.parsedRateLimit = limit
+			rule.parsedBurst = burst
+			// Create the rate limiter for this tool
+			e.limiters[normalized] = rate.NewLimiter(limit, burst)
 		}
 
 		// Compile all regex patterns for this tool
@@ -373,6 +459,19 @@ func (e *Engine) IsAllowed(toolName string, args map[string]any) Decision {
 
 	// Normalize tool name for case-insensitive comparison
 	normalized := strings.ToLower(strings.TrimSpace(toolName))
+
+	// Step 0: Check rate limiting FIRST (before any other checks)
+	// Rate limits are enforced regardless of mode (even in monitor mode)
+	if limiter := e.getLimiter(normalized); limiter != nil {
+		if !limiter.Allow() {
+			return Decision{
+				Allowed:           false,
+				Action:            ActionRateLimited,
+				ViolationDetected: true,
+				Reason:            fmt.Sprintf("rate limit exceeded for tool %q", toolName),
+			}
+		}
+	}
 
 	// Step 1: Check if tool has a specific rule with action
 	rule, hasRule := e.toolRules[normalized]
@@ -542,4 +641,37 @@ func (e *Engine) GetAllowedTools() []string {
 	result := make([]string, len(e.policy.Spec.AllowedTools))
 	copy(result, e.policy.Spec.AllowedTools)
 	return result
+}
+
+// getLimiter returns the rate limiter for a tool, or nil if none configured.
+// Thread-safe via read lock.
+func (e *Engine) getLimiter(normalizedTool string) *rate.Limiter {
+	e.limiterMu.RLock()
+	defer e.limiterMu.RUnlock()
+	return e.limiters[normalizedTool]
+}
+
+// ResetLimiter resets the rate limiter for a specific tool.
+// Useful for testing or administrative reset.
+func (e *Engine) ResetLimiter(toolName string) {
+	normalized := strings.ToLower(strings.TrimSpace(toolName))
+	e.limiterMu.Lock()
+	defer e.limiterMu.Unlock()
+
+	if rule, ok := e.toolRules[normalized]; ok && rule.parsedRateLimit > 0 {
+		e.limiters[normalized] = rate.NewLimiter(rule.parsedRateLimit, rule.parsedBurst)
+	}
+}
+
+// ResetAllLimiters resets all rate limiters to their initial state.
+// Useful for testing or administrative reset.
+func (e *Engine) ResetAllLimiters() {
+	e.limiterMu.Lock()
+	defer e.limiterMu.Unlock()
+
+	for normalized, rule := range e.toolRules {
+		if rule.parsedRateLimit > 0 {
+			e.limiters[normalized] = rate.NewLimiter(rule.parsedRateLimit, rule.parsedBurst)
+		}
+	}
 }

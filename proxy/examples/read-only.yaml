@@ -1,0 +1,108 @@
+# AIP Policy: Read-Only Mode
+#
+# This policy allows ONLY read operations - viewing files, listing directories,
+# and searching content. All write, execute, and network operations are blocked.
+#
+# Use case:
+#   - Code review agents that only need to read and analyze code
+#   - Documentation generators that scan existing files
+#   - Static analysis tools
+#
+# Usage:
+#   aip --policy examples/read-only.yaml --target "your-mcp-server"
+
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+
+metadata:
+  name: read-only-agent
+  version: "1.0.0"
+  owner: security-team@company.com
+
+spec:
+  mode: enforce
+
+  # ONLY these read-only tools are allowed
+  # Everything else is blocked by default
+  allowed_tools:
+    # Filesystem reads
+    - cat
+    - ls
+    - head
+    - tail
+    - less
+    - find
+    - tree
+    - wc
+    - file
+    - stat
+    
+    # Content search
+    - grep
+    - egrep
+    - fgrep
+    - rg          # ripgrep
+    - ag          # silver searcher
+    - ack
+    
+    # Viewing/inspection
+    - read_file
+    - list_directory
+    - list_files
+    - get_file_contents
+    - view_file
+    
+    # Git read operations
+    - git_status
+    - git_log
+    - git_diff
+    - git_show
+    - git_blame
+
+  tool_rules:
+    # Ensure 'find' only searches, no -exec or -delete
+    - tool: find
+      action: allow
+      allow_args:
+        # Block dangerous find options
+        command: "^(?!.*(-exec|-delete|-execdir)).*$"
+
+    # Block any tool that could modify files
+    - tool: write_file
+      action: block
+    - tool: edit_file
+      action: block
+    - tool: delete_file
+      action: block
+    - tool: rm
+      action: block
+    - tool: mv
+      action: block
+    - tool: cp
+      action: block
+    - tool: chmod
+      action: block
+    - tool: chown
+      action: block
+
+    # Block execution tools
+    - tool: exec_command
+      action: block
+    - tool: run_command
+      action: block
+    - tool: shell
+      action: block
+    - tool: bash
+      action: block
+    - tool: sh
+      action: block
+
+    # Block network operations
+    - tool: curl
+      action: block
+    - tool: wget
+      action: block
+    - tool: fetch_url
+      action: block
+    - tool: http_request
+      action: block

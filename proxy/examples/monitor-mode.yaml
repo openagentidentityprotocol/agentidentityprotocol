@@ -1,0 +1,79 @@
+# AIP Policy: Monitor Mode (Audit-Only)
+#
+# This policy logs ALL tool invocations without blocking anything.
+# Perfect for understanding agent behavior before enforcing policies.
+#
+# Use case:
+#   - Initial deployment to observe agent behavior
+#   - Testing new policies before enforcement
+#   - Compliance auditing
+#   - Debugging agent workflows
+#
+# Usage:
+#   aip --policy examples/monitor-mode.yaml --target "your-mcp-server"
+#
+# View audit log:
+#   cat aip-audit.jsonl | jq '.'
+#
+# Find violations (would have been blocked in enforce mode):
+#   cat aip-audit.jsonl | jq 'select(.violation == true)'
+
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+
+metadata:
+  name: monitor-all
+  version: "1.0.0"
+  owner: platform-team@company.com
+
+spec:
+  # MONITOR MODE: Log everything, block nothing
+  # Violations are recorded but requests pass through
+  mode: monitor
+
+  # Define what WOULD be allowed in enforce mode
+  # Tools not in this list will be logged as "violation: true"
+  allowed_tools:
+    # Common safe operations
+    - read_file
+    - list_directory
+    - search_files
+    - grep
+    - find
+    - cat
+    - ls
+
+  # Tool rules that WOULD apply in enforce mode
+  # In monitor mode, violations are logged but allowed
+  tool_rules:
+    # Track file writes (would be blocked in enforce)
+    - tool: write_file
+      action: block
+
+    # Track shell execution (would be blocked in enforce)
+    - tool: exec_command
+      action: block
+
+    # Track git writes (would require approval in enforce)
+    - tool: git_push
+      action: ask
+
+    # Track external requests (would be blocked in enforce)
+    - tool: fetch_url
+      action: block
+      allow_args:
+        url: "^https://.*"  # Would only allow HTTPS
+
+  # DLP scanning still applies in monitor mode
+  # Sensitive data is redacted from responses
+  dlp:
+    enabled: true
+    patterns:
+      - name: "API Key"
+        regex: "(?i)(api[_-]?key|apikey)\\s*[:=]\\s*['\"]?([a-zA-Z0-9-_]{20,})['\"]?"
+      
+      - name: "Password"
+        regex: "(?i)(password|passwd|pwd)\\s*[:=]\\s*['\"]?([^\\s'\"]+)['\"]?"
+      
+      - name: "Email"
+        regex: "[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"

@@ -2,6 +2,8 @@
 package policy
 
 import (
+	"os"
+	"strings"
 	"testing"
 )
 
@@ -1280,4 +1282,836 @@ func containsSubstringHelper(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// -----------------------------------------------------------------------------
+// Strict Args Tests
+// -----------------------------------------------------------------------------
+
+// TestStrictArgsRejectsUndeclaredArgs tests that strict_args mode blocks
+// arguments not declared in allow_args.
+func TestStrictArgsRejectsUndeclaredArgs(t *testing.T) {
+	policyYAML := `
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: strict-args-test
+spec:
+  tool_rules:
+    - tool: fetch_url
+      strict_args: true
+      allow_args:
+        url: "^https://.*"
+`
+	engine := NewEngine()
+	if err := engine.Load([]byte(policyYAML)); err != nil {
+		t.Fatalf("Failed to load policy: %v", err)
+	}
+
+	tests := []struct {
+		name        string
+		args        map[string]any
+		wantAllowed bool
+		wantReason  string
+	}{
+		{
+			name:        "only declared arg - allowed",
+			args:        map[string]any{"url": "https://github.com"},
+			wantAllowed: true,
+		},
+		{
+			name:        "undeclared arg - blocked",
+			args:        map[string]any{"url": "https://github.com", "headers": map[string]any{"X-Exfil": "secret"}},
+			wantAllowed: false,
+			wantReason:  "undeclared argument",
+		},
+		{
+			name:        "multiple undeclared args - blocked",
+			args:        map[string]any{"url": "https://github.com", "timeout": 30, "retry": true},
+			wantAllowed: false,
+			wantReason:  "undeclared argument",
+		},
+		{
+			name:        "no args when required - blocked",
+			args:        map[string]any{},
+			wantAllowed: false,
+			wantReason:  "required argument missing",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			decision := engine.IsAllowed("fetch_url", tt.args)
+			if decision.Allowed != tt.wantAllowed {
+				t.Errorf("Allowed = %v, want %v (reason: %s)", decision.Allowed, tt.wantAllowed, decision.Reason)
+			}
+			if tt.wantReason != "" && !containsSubstring(decision.Reason, tt.wantReason) {
+				t.Errorf("Reason = %q, want to contain %q", decision.Reason, tt.wantReason)
+			}
+		})
+	}
+}
+
+// TestStrictArgsDefault tests the global strict_args_default setting.
+func TestStrictArgsDefault(t *testing.T) {
+	policyYAML := `
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: strict-default-test
+spec:
+  strict_args_default: true
+  tool_rules:
+    - tool: api_call
+      allow_args:
+        endpoint: "^/api/.*"
+    - tool: lenient_tool
+      strict_args: false
+      allow_args:
+        param: "^valid$"
+`
+	engine := NewEngine()
+	if err := engine.Load([]byte(policyYAML)); err != nil {
+		t.Fatalf("Failed to load policy: %v", err)
+	}
+
+	tests := []struct {
+		name        string
+		tool        string
+		args        map[string]any
+		wantAllowed bool
+	}{
+		{
+			name:        "global strict - extra arg blocked",
+			tool:        "api_call",
+			args:        map[string]any{"endpoint": "/api/users", "extra": "data"},
+			wantAllowed: false,
+		},
+		{
+			name:        "global strict - only declared allowed",
+			tool:        "api_call",
+			args:        map[string]any{"endpoint": "/api/users"},
+			wantAllowed: true,
+		},
+		{
+			name:        "override to lenient - extra arg allowed",
+			tool:        "lenient_tool",
+			args:        map[string]any{"param": "valid", "extra": "ignored"},
+			wantAllowed: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			decision := engine.IsAllowed(tt.tool, tt.args)
+			if decision.Allowed != tt.wantAllowed {
+				t.Errorf("Allowed = %v, want %v (reason: %s)", decision.Allowed, tt.wantAllowed, decision.Reason)
+			}
+		})
+	}
+}
+
+// TestStrictArgsWithAskAction tests strict_args with action=ask.
+func TestStrictArgsWithAskAction(t *testing.T) {
+	policyYAML := `
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: strict-ask-test
+spec:
+  tool_rules:
+    - tool: dangerous_tool
+      action: ask
+      strict_args: true
+      allow_args:
+        target: "^(staging|prod)$"
+`
+	engine := NewEngine()
+	if err := engine.Load([]byte(policyYAML)); err != nil {
+		t.Fatalf("Failed to load policy: %v", err)
+	}
+
+	tests := []struct {
+		name       string
+		args       map[string]any
+		wantAction string
+	}{
+		{
+			name:       "valid args - returns ASK",
+			args:       map[string]any{"target": "staging"},
+			wantAction: ActionAsk,
+		},
+		{
+			name:       "undeclared arg - returns BLOCK (not ASK)",
+			args:       map[string]any{"target": "staging", "force": true},
+			wantAction: ActionBlock,
+		},
+		{
+			name:       "invalid arg value - returns BLOCK",
+			args:       map[string]any{"target": "development"},
+			wantAction: ActionBlock,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			decision := engine.IsAllowed("dangerous_tool", tt.args)
+			if decision.Action != tt.wantAction {
+				t.Errorf("Action = %q, want %q (reason: %s)", decision.Action, tt.wantAction, decision.Reason)
+			}
+		})
+	}
+}
+
+// TestStrictArgsExfiltrationPrevention is the key security test.
+// It simulates the exact attack vector from the security review.
+func TestStrictArgsExfiltrationPrevention(t *testing.T) {
+	// Attack scenario: Attacker tries to exfiltrate data via headers
+	policyYAML := `
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: exfil-prevention-test
+spec:
+  tool_rules:
+    - tool: http_request
+      strict_args: true
+      allow_args:
+        url: "^https://api\\.github\\.com/.*"
+        method: "^(GET|POST)$"
+`
+	engine := NewEngine()
+	if err := engine.Load([]byte(policyYAML)); err != nil {
+		t.Fatalf("Failed to load policy: %v", err)
+	}
+
+	// Attack payload - trying to exfiltrate via headers
+	attackPayload := map[string]any{
+		"url":    "https://api.github.com/repos",
+		"method": "POST",
+		"headers": map[string]any{
+			"X-Exfiltrate": "AKIAIOSFODNN7EXAMPLE",
+		},
+		"body": "stolen data here",
+	}
+
+	decision := engine.IsAllowed("http_request", attackPayload)
+
+	if decision.Allowed {
+		t.Fatal("SECURITY FAILURE: Exfiltration attack via headers should be blocked!")
+	}
+
+	if decision.Action != ActionBlock {
+		t.Errorf("Expected ActionBlock, got %s", decision.Action)
+	}
+
+	// Verify the reason mentions the undeclared argument
+	if !containsSubstring(decision.Reason, "undeclared") {
+		t.Errorf("Reason should mention undeclared argument, got: %s", decision.Reason)
+	}
+}
+
+// TestLenientModeDefault tests that without strict_args, extra args are allowed.
+func TestLenientModeDefault(t *testing.T) {
+	policyYAML := `
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: lenient-test
+spec:
+  tool_rules:
+    - tool: flexible_tool
+      allow_args:
+        required_param: "^valid$"
+`
+	engine := NewEngine()
+	if err := engine.Load([]byte(policyYAML)); err != nil {
+		t.Fatalf("Failed to load policy: %v", err)
+	}
+
+	// Extra args should be allowed in default lenient mode
+	decision := engine.IsAllowed("flexible_tool", map[string]any{
+		"required_param": "valid",
+		"extra1":         "anything",
+		"extra2":         map[string]any{"nested": "data"},
+	})
+
+	if !decision.Allowed {
+		t.Errorf("Lenient mode should allow extra args, got blocked: %s", decision.Reason)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Method Allowlist Tests
+// -----------------------------------------------------------------------------
+
+// TestDefaultMethodsAllowed tests that default safe methods are allowed
+// when no explicit allowed_methods is specified in the policy.
+func TestDefaultMethodsAllowed(t *testing.T) {
+	policyYAML := `
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: default-methods-test
+spec:
+  allowed_tools:
+    - some_tool
+`
+	engine := NewEngine()
+	if err := engine.Load([]byte(policyYAML)); err != nil {
+		t.Fatalf("Failed to load policy: %v", err)
+	}
+
+	// Default safe methods should be allowed
+	safeTests := []struct {
+		method  string
+		allowed bool
+	}{
+		{"tools/call", true},
+		{"tools/list", true},
+		{"initialize", true},
+		{"initialized", true},
+		{"ping", true},
+		{"completion/complete", true},
+		{"notifications/initialized", true},
+		{"notifications/progress", true},
+	}
+
+	for _, tt := range safeTests {
+		t.Run("safe:"+tt.method, func(t *testing.T) {
+			decision := engine.IsMethodAllowed(tt.method)
+			if decision.Allowed != tt.allowed {
+				t.Errorf("IsMethodAllowed(%q) = %v, want %v (reason: %s)",
+					tt.method, decision.Allowed, tt.allowed, decision.Reason)
+			}
+		})
+	}
+
+	// Dangerous methods should be blocked by default
+	dangerousTests := []struct {
+		method  string
+		allowed bool
+	}{
+		{"resources/read", false},
+		{"resources/list", false},
+		{"prompts/get", false},
+		{"prompts/list", false},
+		{"logging/setLevel", false},
+		{"custom/dangerous", false},
+	}
+
+	for _, tt := range dangerousTests {
+		t.Run("dangerous:"+tt.method, func(t *testing.T) {
+			decision := engine.IsMethodAllowed(tt.method)
+			if decision.Allowed != tt.allowed {
+				t.Errorf("IsMethodAllowed(%q) = %v, want %v (reason: %s)",
+					tt.method, decision.Allowed, tt.allowed, decision.Reason)
+			}
+		})
+	}
+}
+
+// TestExplicitMethodAllowlist tests that explicit allowed_methods overrides defaults.
+func TestExplicitMethodAllowlist(t *testing.T) {
+	policyYAML := `
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: explicit-methods-test
+spec:
+  allowed_methods:
+    - tools/call
+    - resources/read
+  allowed_tools:
+    - some_tool
+`
+	engine := NewEngine()
+	if err := engine.Load([]byte(policyYAML)); err != nil {
+		t.Fatalf("Failed to load policy: %v", err)
+	}
+
+	tests := []struct {
+		method  string
+		allowed bool
+	}{
+		{"tools/call", true},    // Explicitly allowed
+		{"resources/read", true}, // Explicitly allowed (normally blocked)
+		{"tools/list", false},   // NOT in explicit list
+		{"ping", false},         // NOT in explicit list
+		{"prompts/get", false},  // NOT in explicit list
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.method, func(t *testing.T) {
+			decision := engine.IsMethodAllowed(tt.method)
+			if decision.Allowed != tt.allowed {
+				t.Errorf("IsMethodAllowed(%q) = %v, want %v (reason: %s)",
+					tt.method, decision.Allowed, tt.allowed, decision.Reason)
+			}
+		})
+	}
+}
+
+// TestMethodDenylistTakesPrecedence tests that denied_methods blocks even
+// if the method is in allowed_methods.
+func TestMethodDenylistTakesPrecedence(t *testing.T) {
+	policyYAML := `
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: deny-precedence-test
+spec:
+  allowed_methods:
+    - "*"
+  denied_methods:
+    - resources/read
+    - resources/write
+  allowed_tools:
+    - some_tool
+`
+	engine := NewEngine()
+	if err := engine.Load([]byte(policyYAML)); err != nil {
+		t.Fatalf("Failed to load policy: %v", err)
+	}
+
+	tests := []struct {
+		method  string
+		allowed bool
+	}{
+		{"tools/call", true},      // Allowed by wildcard
+		{"prompts/get", true},     // Allowed by wildcard
+		{"resources/read", false}, // Explicitly denied (deny wins)
+		{"resources/write", false}, // Explicitly denied
+		{"resources/list", true},  // Not denied, allowed by wildcard
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.method, func(t *testing.T) {
+			decision := engine.IsMethodAllowed(tt.method)
+			if decision.Allowed != tt.allowed {
+				t.Errorf("IsMethodAllowed(%q) = %v, want %v (reason: %s)",
+					tt.method, decision.Allowed, tt.allowed, decision.Reason)
+			}
+		})
+	}
+}
+
+// TestMethodCaseInsensitive tests that method matching is case-insensitive.
+func TestMethodCaseInsensitive(t *testing.T) {
+	policyYAML := `
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: case-test
+spec:
+  allowed_methods:
+    - tools/call
+  denied_methods:
+    - Resources/Read
+  allowed_tools:
+    - some_tool
+`
+	engine := NewEngine()
+	if err := engine.Load([]byte(policyYAML)); err != nil {
+		t.Fatalf("Failed to load policy: %v", err)
+	}
+
+	// All case variations should match
+	allowedVariants := []string{
+		"tools/call",
+		"TOOLS/CALL",
+		"Tools/Call",
+		"tOoLs/CaLl",
+	}
+
+	for _, v := range allowedVariants {
+		t.Run("allowed:"+v, func(t *testing.T) {
+			decision := engine.IsMethodAllowed(v)
+			if !decision.Allowed {
+				t.Errorf("IsMethodAllowed(%q) should be allowed", v)
+			}
+		})
+	}
+
+	// Denied should also be case-insensitive
+	deniedVariants := []string{
+		"resources/read",
+		"RESOURCES/READ",
+		"Resources/Read",
+	}
+
+	for _, v := range deniedVariants {
+		t.Run("denied:"+v, func(t *testing.T) {
+			decision := engine.IsMethodAllowed(v)
+			if decision.Allowed {
+				t.Errorf("IsMethodAllowed(%q) should be denied", v)
+			}
+		})
+	}
+}
+
+// TestWildcardMethod tests that "*" allows all methods (except denied).
+func TestWildcardMethod(t *testing.T) {
+	policyYAML := `
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: wildcard-test
+spec:
+  allowed_methods:
+    - "*"
+  allowed_tools:
+    - some_tool
+`
+	engine := NewEngine()
+	if err := engine.Load([]byte(policyYAML)); err != nil {
+		t.Fatalf("Failed to load policy: %v", err)
+	}
+
+	// Everything should be allowed with wildcard
+	methods := []string{
+		"tools/call",
+		"resources/read",
+		"resources/write",
+		"prompts/get",
+		"custom/anything",
+		"completely/unknown/method",
+	}
+
+	for _, m := range methods {
+		t.Run(m, func(t *testing.T) {
+			decision := engine.IsMethodAllowed(m)
+			if !decision.Allowed {
+				t.Errorf("IsMethodAllowed(%q) with wildcard should be allowed", m)
+			}
+		})
+	}
+}
+
+// TestGetAllowedMethods tests the getter for allowed methods.
+func TestGetAllowedMethods(t *testing.T) {
+	policyYAML := `
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: getter-test
+spec:
+  allowed_methods:
+    - tools/call
+    - tools/list
+  allowed_tools:
+    - some_tool
+`
+	engine := NewEngine()
+	if err := engine.Load([]byte(policyYAML)); err != nil {
+		t.Fatalf("Failed to load policy: %v", err)
+	}
+
+	methods := engine.GetAllowedMethods()
+	if len(methods) != 2 {
+		t.Errorf("Expected 2 allowed methods, got %d", len(methods))
+	}
+}
+
+// TestResourcesReadBypassPrevention is the key security test.
+// It verifies that the resources/read bypass attack is prevented.
+func TestResourcesReadBypassPrevention(t *testing.T) {
+	// This is the attack scenario from the security review
+	policyYAML := `
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: security-test
+spec:
+  # Default allowed_methods - resources/read should be BLOCKED
+  allowed_tools:
+    - read_file
+`
+	engine := NewEngine()
+	if err := engine.Load([]byte(policyYAML)); err != nil {
+		t.Fatalf("Failed to load policy: %v", err)
+	}
+
+	// Attacker tries to bypass tool policy via resources/read
+	decision := engine.IsMethodAllowed("resources/read")
+	if decision.Allowed {
+		t.Error("SECURITY FAILURE: resources/read should be blocked by default!")
+	}
+
+	// Also test variations attackers might try
+	attacks := []string{
+		"resources/read",
+		"Resources/Read",
+		"RESOURCES/READ",
+		"resources/list",
+		"prompts/get",
+	}
+
+	for _, attack := range attacks {
+		t.Run("attack:"+attack, func(t *testing.T) {
+			decision := engine.IsMethodAllowed(attack)
+			if decision.Allowed {
+				t.Errorf("SECURITY FAILURE: %q should be blocked!", attack)
+			}
+		})
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Protected Paths Tests
+// -----------------------------------------------------------------------------
+
+// TestProtectedPathsBlocksPolicyFile tests that the policy file is protected.
+func TestProtectedPathsBlocksPolicyFile(t *testing.T) {
+	// Create a temp file to act as policy file
+	tmpFile := "/tmp/test-policy-protected.yaml"
+	policyYAML := `
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: protected-paths-test
+spec:
+  allowed_tools:
+    - write_file
+    - read_file
+`
+	// Write temp policy file
+	if err := os.WriteFile(tmpFile, []byte(policyYAML), 0644); err != nil {
+		t.Fatalf("Failed to write temp policy: %v", err)
+	}
+	defer os.Remove(tmpFile)
+
+	engine := NewEngine()
+	if err := engine.LoadFromFile(tmpFile); err != nil {
+		t.Fatalf("Failed to load policy: %v", err)
+	}
+
+	// Verify policy file is in protected paths
+	protectedPaths := engine.GetProtectedPaths()
+	found := false
+	for _, p := range protectedPaths {
+		if strings.Contains(p, "test-policy-protected.yaml") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("Policy file should be automatically added to protected paths")
+	}
+
+	// Try to write to policy file - should be blocked
+	decision := engine.IsAllowed("write_file", map[string]any{
+		"path":    tmpFile,
+		"content": "malicious: true",
+	})
+	if decision.Allowed {
+		t.Fatal("SECURITY FAILURE: Writing to policy file should be blocked!")
+	}
+	if !strings.Contains(decision.Reason, "protected path") {
+		t.Errorf("Reason should mention protected path, got: %s", decision.Reason)
+	}
+
+	// Try to read policy file - should also be blocked
+	decision = engine.IsAllowed("read_file", map[string]any{
+		"path": tmpFile,
+	})
+	if decision.Allowed {
+		t.Error("SECURITY FAILURE: Reading policy file should be blocked!")
+	}
+}
+
+// TestProtectedPathsCustomPaths tests custom protected paths in policy.
+func TestProtectedPathsCustomPaths(t *testing.T) {
+	policyYAML := `
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: custom-protected-paths
+spec:
+  allowed_tools:
+    - write_file
+    - run_command
+  protected_paths:
+    - /etc/passwd
+    - /etc/shadow
+    - ~/.ssh
+`
+	engine := NewEngine()
+	if err := engine.Load([]byte(policyYAML)); err != nil {
+		t.Fatalf("Failed to load policy: %v", err)
+	}
+
+	tests := []struct {
+		name        string
+		tool        string
+		args        map[string]any
+		wantAllowed bool
+	}{
+		{
+			name:        "write to /etc/passwd - blocked",
+			tool:        "write_file",
+			args:        map[string]any{"path": "/etc/passwd"},
+			wantAllowed: false,
+		},
+		{
+			name:        "write to /etc/shadow - blocked",
+			tool:        "write_file",
+			args:        map[string]any{"path": "/etc/shadow"},
+			wantAllowed: false,
+		},
+		{
+			name:        "write to normal file - allowed",
+			tool:        "write_file",
+			args:        map[string]any{"path": "/tmp/safe-file.txt"},
+			wantAllowed: true,
+		},
+		{
+			name:        "command with protected path - blocked",
+			tool:        "run_command",
+			args:        map[string]any{"command": "cat /etc/passwd"},
+			wantAllowed: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			decision := engine.IsAllowed(tt.tool, tt.args)
+			if decision.Allowed != tt.wantAllowed {
+				t.Errorf("Allowed = %v, want %v (reason: %s)",
+					decision.Allowed, tt.wantAllowed, decision.Reason)
+			}
+		})
+	}
+}
+
+// TestProtectedPathsNestedArgs tests that nested arguments are scanned.
+func TestProtectedPathsNestedArgs(t *testing.T) {
+	policyYAML := `
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: nested-protected-paths
+spec:
+  allowed_tools:
+    - complex_tool
+  protected_paths:
+    - /secret/credentials.json
+`
+	engine := NewEngine()
+	if err := engine.Load([]byte(policyYAML)); err != nil {
+		t.Fatalf("Failed to load policy: %v", err)
+	}
+
+	// Nested in map
+	decision := engine.IsAllowed("complex_tool", map[string]any{
+		"config": map[string]any{
+			"output": "/secret/credentials.json",
+		},
+	})
+	if decision.Allowed {
+		t.Error("Protected path nested in map should be blocked")
+	}
+
+	// Nested in array
+	decision = engine.IsAllowed("complex_tool", map[string]any{
+		"files": []any{"/tmp/ok.txt", "/secret/credentials.json"},
+	})
+	if decision.Allowed {
+		t.Error("Protected path in array should be blocked")
+	}
+}
+
+// TestProtectedPathsSelfModificationAttack is the key security test.
+// Simulates the exact attack from the security review.
+func TestProtectedPathsSelfModificationAttack(t *testing.T) {
+	tmpFile := "/tmp/attack-test-policy.yaml"
+	policyYAML := `
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: self-mod-defense
+spec:
+  allowed_tools:
+    - write_file
+    - edit_file
+    - fs_write
+`
+	if err := os.WriteFile(tmpFile, []byte(policyYAML), 0644); err != nil {
+		t.Fatalf("Failed to write temp policy: %v", err)
+	}
+	defer os.Remove(tmpFile)
+
+	engine := NewEngine()
+	if err := engine.LoadFromFile(tmpFile); err != nil {
+		t.Fatalf("Failed to load policy: %v", err)
+	}
+
+	// Attack 1: Direct write to policy file
+	attack1 := engine.IsAllowed("write_file", map[string]any{
+		"path": tmpFile,
+		"content": `
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+spec:
+  allowed_tools:
+    - "*"  # Allow everything!
+`,
+	})
+	if attack1.Allowed {
+		t.Fatal("SECURITY FAILURE: Direct policy modification should be blocked!")
+	}
+
+	// Attack 2: Edit policy file
+	attack2 := engine.IsAllowed("edit_file", map[string]any{
+		"file":    tmpFile,
+		"changes": "add malicious_tool to allowed_tools",
+	})
+	if attack2.Allowed {
+		t.Fatal("SECURITY FAILURE: Policy edit should be blocked!")
+	}
+
+	// Attack 3: Using a generic write tool
+	attack3 := engine.IsAllowed("fs_write", map[string]any{
+		"target": tmpFile,
+		"data":   "mode: monitor",
+	})
+	if attack3.Allowed {
+		t.Fatal("SECURITY FAILURE: fs_write to policy should be blocked!")
+	}
+}
+
+// TestAddProtectedPath tests dynamically adding protected paths.
+func TestAddProtectedPath(t *testing.T) {
+	policyYAML := `
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: dynamic-protection
+spec:
+  allowed_tools:
+    - write_file
+`
+	engine := NewEngine()
+	if err := engine.Load([]byte(policyYAML)); err != nil {
+		t.Fatalf("Failed to load policy: %v", err)
+	}
+
+	// Initially allowed
+	decision := engine.IsAllowed("write_file", map[string]any{
+		"path": "/var/log/app.log",
+	})
+	if !decision.Allowed {
+		t.Error("Should be allowed before adding protection")
+	}
+
+	// Add protection dynamically
+	engine.AddProtectedPath("/var/log/app.log")
+
+	// Now blocked
+	decision = engine.IsAllowed("write_file", map[string]any{
+		"path": "/var/log/app.log",
+	})
+	if decision.Allowed {
+		t.Error("Should be blocked after adding protection")
+	}
 }

@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -92,6 +93,47 @@ type PolicySpec struct {
 	// TODO: Implement in v0.2
 	DeniedTools []string `yaml:"denied_tools,omitempty"`
 
+	// AllowedMethods specifies which JSON-RPC methods are permitted.
+	// This is the FIRST line of defense - checked before tool-level policy.
+	//
+	// If empty, defaults to safe methods: tools/call, tools/list, initialize,
+	// initialized, ping, notifications/*, completion/complete.
+	//
+	// SECURITY: Methods like "resources/read", "resources/list", "prompts/get"
+	// are NOT in the default allowlist. If your MCP server needs them, you must
+	// explicitly add them here.
+	//
+	// Use "*" to allow all methods (NOT RECOMMENDED for production).
+	AllowedMethods []string `yaml:"allowed_methods,omitempty"`
+
+	// DeniedMethods explicitly blocks specific JSON-RPC methods.
+	// Takes precedence over AllowedMethods (deny wins).
+	// Useful for blocking specific methods while allowing most others.
+	DeniedMethods []string `yaml:"denied_methods,omitempty"`
+
+	// StrictArgsDefault sets the default strict_args value for all tool rules.
+	// When true, tools reject any arguments not declared in allow_args.
+	// Individual tool rules can override this with their own strict_args setting.
+	// Default: false (lenient mode for backward compatibility)
+	StrictArgsDefault bool `yaml:"strict_args_default,omitempty"`
+
+	// ProtectedPaths is a list of file paths that tools may not read, write, or modify.
+	// Any tool argument containing a protected path will be blocked.
+	//
+	// The policy file itself is ALWAYS protected (added automatically).
+	// Use this to protect additional sensitive files like:
+	//   - Configuration files
+	//   - SSH keys (~/.ssh/*)
+	//   - Environment files (.env)
+	//   - Credentials
+	//
+	// Example:
+	//   protected_paths:
+	//     - ~/.ssh
+	//     - ~/.aws/credentials
+	//     - .env
+	ProtectedPaths []string `yaml:"protected_paths,omitempty"`
+
 	// Mode controls policy enforcement behavior.
 	// Values:
 	//   - "enforce" (default): Violations are blocked, error returned to client
@@ -124,6 +166,32 @@ type PolicySpec struct {
 type DLPConfig struct {
 	// Enabled controls whether DLP scanning is active (default: true if dlp block exists)
 	Enabled *bool `yaml:"enabled,omitempty"`
+
+	// DetectEncoding enables automatic detection and decoding of base64/hex encoded
+	// strings before pattern matching. This catches secrets encoded to bypass DLP.
+	//
+	// When enabled:
+	//   - Strings matching base64 patterns are decoded and scanned
+	//   - Strings matching hex patterns (0x prefix or long hex) are decoded and scanned
+	//   - If a secret is found in decoded content, the original encoded string is redacted
+	//
+	// Example attack prevented:
+	//   Secret:  AKIAIOSFODNN7EXAMPLE
+	//   Encoded: QUtJQUlPU0ZPRE5ON0VYQU1QTEU=
+	//   Without detect_encoding: Passes through (no match)
+	//   With detect_encoding:    Redacted (decoded, matched, original replaced)
+	//
+	// Default: false (for backward compatibility and performance)
+	DetectEncoding bool `yaml:"detect_encoding,omitempty"`
+
+	// FilterStderr applies DLP scanning to subprocess stderr output.
+	// When enabled, any sensitive data in error logs is redacted before display.
+	//
+	// This prevents information leakage through error messages, stack traces,
+	// and debug output that might contain secrets.
+	//
+	// Default: false (for backward compatibility)
+	FilterStderr bool `yaml:"filter_stderr,omitempty"`
 
 	// Patterns defines the sensitive data patterns to detect and redact.
 	Patterns []DLPPattern `yaml:"patterns"`
@@ -164,6 +232,10 @@ func (d *DLPConfig) IsEnabled() bool {
 //	    action: ask
 //	  - tool: expensive_api_call
 //	    rate_limit: "5/minute"
+//	  - tool: high_security_tool
+//	    strict_args: true
+//	    allow_args:
+//	      param: "^valid$"
 type ToolRule struct {
 	// Tool is the name of the tool this rule applies to.
 	Tool string `yaml:"tool"`
@@ -180,6 +252,20 @@ type ToolRule struct {
 	// Examples: "5/minute", "100/hour", "10/second"
 	// If empty, no rate limiting is applied.
 	RateLimit string `yaml:"rate_limit,omitempty"`
+
+	// StrictArgs when true rejects any arguments not explicitly declared in AllowArgs.
+	// Default: nil (inherit from strict_args_default)
+	// Set to true/false to override the global default for this specific tool.
+	//
+	// Use strict_args: true for high-security tools where unknown arguments
+	// could be used for data exfiltration or bypass attacks.
+	//
+	// Example attack prevented:
+	//   Policy validates: url: "^https://github.com/.*"
+	//   Attacker sends:   {"url": "https://github.com/ok", "headers": {"X-Exfil": "secret"}}
+	//   Without strict:   headers passes through unchecked
+	//   With strict:      BLOCKED - "headers" not in allow_args
+	StrictArgs *bool `yaml:"strict_args,omitempty"`
 
 	// AllowArgs maps argument names to regex patterns.
 	// Each argument value must match its corresponding regex.
@@ -263,6 +349,9 @@ const (
 	ActionAsk = "ask"
 	// ActionRateLimited indicates the call was blocked due to rate limiting.
 	ActionRateLimited = "rate_limited"
+	// ActionProtectedPath indicates the call was blocked due to accessing a protected path.
+	// This is a security-critical event that should be audited separately.
+	ActionProtectedPath = "protected_path"
 )
 
 // Engine evaluates tool calls against the loaded policy.
@@ -285,12 +374,24 @@ type Engine struct {
 	// Key = normalized tool name, Value = ToolRule with compiled regexes.
 	toolRules map[string]*ToolRule
 
+	// allowedMethods provides O(1) lookup for allowed JSON-RPC methods.
+	// Populated during Load() from policy.Spec.AllowedMethods.
+	allowedMethods map[string]struct{}
+
+	// deniedMethods provides O(1) lookup for denied JSON-RPC methods.
+	// Takes precedence over allowedMethods.
+	deniedMethods map[string]struct{}
+
+	// protectedPaths holds paths that tools may not access.
+	// Always includes the policy file itself.
+	protectedPaths []string
+
 	// mode controls enforcement behavior: "enforce" (default) or "monitor".
 	// In monitor mode, violations are logged but allowed through.
 	mode string
 
 	// limiters holds per-tool rate limiters.
-	// Key = normalized tool name, Value = token bucket limiter.
+	// Key = normalized tool name, Value = ToolRule with compiled regexes.
 	// Populated during Load() for tools with rate_limit defined.
 	limiters map[string]*rate.Limiter
 
@@ -298,14 +399,46 @@ type Engine struct {
 	limiterMu sync.RWMutex
 }
 
+// DefaultAllowedMethods are safe JSON-RPC methods permitted when no explicit list is provided.
+// These methods are considered safe because they either:
+//   - Are required for MCP protocol handshake (initialize, initialized, ping)
+//   - Are already policy-checked at the tool level (tools/call)
+//   - Are read-only metadata operations (tools/list)
+//   - Are client-side notifications that don't access resources
+//
+// SECURITY NOTE: The following methods are intentionally EXCLUDED:
+//   - resources/read, resources/list (can read arbitrary files)
+//   - prompts/get, prompts/list (can access prompt templates)
+//   - logging/* (could leak information)
+//
+// If your MCP server needs these methods, explicitly add them to allowed_methods.
+var DefaultAllowedMethods = []string{
+	"initialize",
+	"initialized",
+	"ping",
+	"tools/call",
+	"tools/list",
+	"completion/complete",
+	"notifications/initialized",
+	"notifications/progress",
+	"notifications/message",
+	"notifications/resources/updated",
+	"notifications/resources/list_changed",
+	"notifications/tools/list_changed",
+	"notifications/prompts/list_changed",
+	"cancelled",
+}
+
 // NewEngine creates a new policy engine instance.
 //
 // The engine is not usable until Load() or LoadFromFile() is called.
 func NewEngine() *Engine {
 	return &Engine{
-		allowedSet: make(map[string]struct{}),
-		toolRules:  make(map[string]*ToolRule),
-		limiters:   make(map[string]*rate.Limiter),
+		allowedSet:     make(map[string]struct{}),
+		toolRules:      make(map[string]*ToolRule),
+		allowedMethods: make(map[string]struct{}),
+		deniedMethods:  make(map[string]struct{}),
+		limiters:       make(map[string]*rate.Limiter),
 	}
 }
 
@@ -334,10 +467,10 @@ func (e *Engine) Load(data []byte) error {
 	}
 
 	// Build the allowed set for O(1) lookups
-	// Normalize to lowercase for case-insensitive matching
+	// Use NormalizeName for Unicode-safe, case-insensitive matching
 	e.allowedSet = make(map[string]struct{}, len(policy.Spec.AllowedTools))
 	for _, tool := range policy.Spec.AllowedTools {
-		normalized := strings.ToLower(strings.TrimSpace(tool))
+		normalized := NormalizeName(tool)
 		e.allowedSet[normalized] = struct{}{}
 	}
 
@@ -346,7 +479,7 @@ func (e *Engine) Load(data []byte) error {
 	e.limiters = make(map[string]*rate.Limiter)
 	for i := range policy.Spec.ToolRules {
 		rule := &policy.Spec.ToolRules[i]
-		normalized := strings.ToLower(strings.TrimSpace(rule.Tool))
+		normalized := NormalizeName(rule.Tool)
 
 		// Normalize and validate action field
 		rule.Action = strings.ToLower(strings.TrimSpace(rule.Action))
@@ -369,10 +502,15 @@ func (e *Engine) Load(data []byte) error {
 			e.limiters[normalized] = rate.NewLimiter(limit, burst)
 		}
 
-		// Compile all regex patterns for this tool
+		// Compile all regex patterns for this tool with ReDoS protection
 		rule.compiledArgs = make(map[string]*regexp.Regexp, len(rule.AllowArgs))
 		for argName, pattern := range rule.AllowArgs {
-			compiled, err := regexp.Compile(pattern)
+			// Validate regex complexity before compilation (best-effort heuristic)
+			if err := ValidateRegexComplexity(pattern); err != nil {
+				return fmt.Errorf("potentially dangerous regex for tool %q arg %q: %w", rule.Tool, argName, err)
+			}
+			// Compile with timeout to prevent ReDoS at compile time
+			compiled, err := SafeCompile(pattern, 0)
 			if err != nil {
 				return fmt.Errorf("invalid regex for tool %q arg %q: %w", rule.Tool, argName, err)
 			}
@@ -395,17 +533,154 @@ func (e *Engine) Load(data []byte) error {
 		return fmt.Errorf("invalid mode %q, must be 'enforce' or 'monitor'", policy.Spec.Mode)
 	}
 
+	// Build method allowlist for O(1) lookups
+	// If no methods specified, use safe defaults
+	e.allowedMethods = make(map[string]struct{})
+	e.deniedMethods = make(map[string]struct{})
+
+	if len(policy.Spec.AllowedMethods) > 0 {
+		for _, method := range policy.Spec.AllowedMethods {
+			normalized := NormalizeName(method)
+			e.allowedMethods[normalized] = struct{}{}
+		}
+	} else {
+		// Use default safe methods
+		for _, method := range DefaultAllowedMethods {
+			e.allowedMethods[NormalizeName(method)] = struct{}{}
+		}
+	}
+
+	// Build denied methods set (takes precedence over allowed)
+	for _, method := range policy.Spec.DeniedMethods {
+		normalized := NormalizeName(method)
+		e.deniedMethods[normalized] = struct{}{}
+	}
+
+	// Initialize protected paths from policy
+	e.protectedPaths = make([]string, 0, len(policy.Spec.ProtectedPaths))
+	for _, p := range policy.Spec.ProtectedPaths {
+		expanded := expandPath(p)
+		e.protectedPaths = append(e.protectedPaths, expanded)
+	}
+
 	e.policy = &policy
 	return nil
 }
 
 // LoadFromFile reads and parses a policy file from disk.
+// The policy file path is automatically added to protected paths.
 func (e *Engine) LoadFromFile(path string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("failed to read policy file %q: %w", path, err)
 	}
-	return e.Load(data)
+	if err := e.Load(data); err != nil {
+		return err
+	}
+
+	// Add the policy file itself to protected paths (always protected)
+	absPath, err := filepath.Abs(path)
+	if err == nil {
+		e.protectedPaths = append(e.protectedPaths, absPath)
+	} else {
+		// Fallback to original path if abs fails
+		e.protectedPaths = append(e.protectedPaths, path)
+	}
+
+	return nil
+}
+
+// expandPath expands ~ to home directory and resolves to absolute path.
+func expandPath(path string) string {
+	if strings.HasPrefix(path, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			path = filepath.Join(home, path[2:])
+		}
+	}
+	if abs, err := filepath.Abs(path); err == nil {
+		return abs
+	}
+	return path
+}
+
+// checkProtectedPaths scans tool arguments for protected file paths.
+// Returns the protected path that was found, or empty string if none.
+//
+// This is a defense against policy self-modification attacks:
+//   - Agent tries to write to policy.yaml to add itself to allowed_tools
+//   - Agent tries to read policy.yaml to discover blocked tools
+//   - Agent tries to modify other sensitive files
+//
+// The check is performed on all string arguments, recursively scanning
+// nested objects and arrays.
+func (e *Engine) checkProtectedPaths(args map[string]any) string {
+	if len(e.protectedPaths) == 0 {
+		return ""
+	}
+	return e.scanArgsForProtectedPaths(args)
+}
+
+// scanArgsForProtectedPaths recursively scans arguments for protected paths.
+func (e *Engine) scanArgsForProtectedPaths(v any) string {
+	switch val := v.(type) {
+	case string:
+		return e.matchProtectedPath(val)
+	case map[string]any:
+		for _, v := range val {
+			if found := e.scanArgsForProtectedPaths(v); found != "" {
+				return found
+			}
+		}
+	case []any:
+		for _, item := range val {
+			if found := e.scanArgsForProtectedPaths(item); found != "" {
+				return found
+			}
+		}
+	}
+	return ""
+}
+
+// matchProtectedPath checks if a string value matches any protected path.
+func (e *Engine) matchProtectedPath(value string) string {
+	// Expand and normalize the value
+	expanded := expandPath(value)
+
+	for _, protected := range e.protectedPaths {
+		// Exact match
+		if expanded == protected || value == protected {
+			return protected
+		}
+		// Check if value is under protected directory
+		if strings.HasPrefix(expanded, protected+string(filepath.Separator)) {
+			return protected
+		}
+		// Check if protected path is contained in the value (e.g., in a command string)
+		if strings.Contains(value, protected) {
+			return protected
+		}
+		// Also check the base name for common file references
+		if filepath.Base(expanded) == filepath.Base(protected) &&
+			strings.Contains(value, filepath.Base(protected)) {
+			// Only match if it looks like a path (contains separator or starts with .)
+			if strings.ContainsAny(value, "/\\") || strings.HasPrefix(value, ".") {
+				return protected
+			}
+		}
+	}
+	return ""
+}
+
+// GetProtectedPaths returns the list of protected paths for logging.
+func (e *Engine) GetProtectedPaths() []string {
+	return e.protectedPaths
+}
+
+// AddProtectedPath adds a path to the protected list.
+// Useful for adding paths dynamically (e.g., audit log file).
+func (e *Engine) AddProtectedPath(path string) {
+	expanded := expandPath(path)
+	e.protectedPaths = append(e.protectedPaths, expanded)
 }
 
 // Decision contains the result of a tool call authorization check.
@@ -430,7 +705,7 @@ type Decision struct {
 	Allowed bool
 
 	// Action specifies the required action for this tool call.
-	// Values: "allow", "block", "ask"
+	// Values: "allow", "block", "ask", "rate_limited", "protected_path"
 	// When Action="ask", the proxy should prompt the user for approval.
 	Action string
 
@@ -444,6 +719,10 @@ type Decision struct {
 
 	// FailedRule is the regex pattern that failed to match (if any).
 	FailedRule string
+
+	// ProtectedPath is set when Action=ActionProtectedPath, containing the
+	// path that triggered the security block. This is critical for audit.
+	ProtectedPath string
 
 	// Reason provides a human-readable explanation of the decision.
 	Reason string
@@ -503,8 +782,9 @@ func (e *Engine) IsAllowed(toolName string, args map[string]any) Decision {
 		}
 	}
 
-	// Normalize tool name for case-insensitive comparison
-	normalized := strings.ToLower(strings.TrimSpace(toolName))
+	// Normalize tool name using Unicode-safe normalization
+	// This prevents bypass attacks via fullwidth chars, ligatures, etc.
+	normalized := NormalizeName(toolName)
 
 	// Step 0: Check rate limiting FIRST (before any other checks)
 	// Rate limits are enforced regardless of mode (even in monitor mode)
@@ -516,6 +796,19 @@ func (e *Engine) IsAllowed(toolName string, args map[string]any) Decision {
 				ViolationDetected: true,
 				Reason:            fmt.Sprintf("rate limit exceeded for tool %q", toolName),
 			}
+		}
+	}
+
+	// Step 0.5: Check protected paths (policy self-modification defense)
+	// This blocks any attempt to read/write/modify protected files
+	// including the policy file itself.
+	if protectedPath := e.checkProtectedPaths(args); protectedPath != "" {
+		return Decision{
+			Allowed:           false,
+			Action:            ActionProtectedPath,
+			ViolationDetected: true,
+			ProtectedPath:     protectedPath,
+			Reason:            fmt.Sprintf("access to protected path %q blocked (policy self-modification defense)", protectedPath),
 		}
 	}
 
@@ -544,6 +837,16 @@ func (e *Engine) IsAllowed(toolName string, args map[string]any) Decision {
 					strValue := argToString(argValue)
 					if !compiledRegex.MatchString(strValue) {
 						return e.makeDecision(false, "argument failed regex validation", argName, rule.AllowArgs[argName])
+					}
+				}
+			}
+			// Check strict args for ASK action too
+			if e.isStrictArgs(rule) && len(args) > 0 {
+				for argName := range args {
+					if _, declared := rule.AllowArgs[argName]; !declared {
+						return e.makeDecision(false,
+							fmt.Sprintf("undeclared argument %q rejected (strict_args enabled)", argName),
+							argName, "")
 					}
 				}
 			}
@@ -592,6 +895,18 @@ func (e *Engine) IsAllowed(toolName string, args map[string]any) Decision {
 		}
 	}
 
+	// Step 5: Strict args mode - reject undeclared arguments
+	// This prevents bypass attacks via extra arguments (e.g., headers, metadata)
+	if e.isStrictArgs(rule) && len(args) > 0 {
+		for argName := range args {
+			if _, declared := rule.AllowArgs[argName]; !declared {
+				return e.makeDecision(false,
+					fmt.Sprintf("undeclared argument %q rejected (strict_args enabled)", argName),
+					argName, "")
+			}
+		}
+	}
+
 	// All argument validations passed
 	return Decision{
 		Allowed:           true,
@@ -599,6 +914,32 @@ func (e *Engine) IsAllowed(toolName string, args map[string]any) Decision {
 		ViolationDetected: false,
 		Reason:            "tool and arguments permitted",
 	}
+}
+
+// isStrictArgs returns true if strict argument validation is enabled for a tool rule.
+// Strict mode rejects any arguments not explicitly declared in allow_args.
+//
+// Priority:
+//  1. Rule-specific strict_args setting (if explicitly set via pointer)
+//  2. Global strict_args_default from policy spec
+//  3. Default: false (lenient mode)
+func (e *Engine) isStrictArgs(rule *ToolRule) bool {
+	if rule == nil {
+		// No rule = use global default
+		if e.policy != nil {
+			return e.policy.Spec.StrictArgsDefault
+		}
+		return false
+	}
+	// Rule-specific setting takes precedence (if explicitly set)
+	if rule.StrictArgs != nil {
+		return *rule.StrictArgs
+	}
+	// Fall back to global default
+	if e.policy != nil {
+		return e.policy.Spec.StrictArgsDefault
+	}
+	return false
 }
 
 // makeDecision creates a Decision based on violation and current mode.
@@ -719,7 +1060,7 @@ func (e *Engine) getLimiter(normalizedTool string) *rate.Limiter {
 // ResetLimiter resets the rate limiter for a specific tool.
 // Useful for testing or administrative reset.
 func (e *Engine) ResetLimiter(toolName string) {
-	normalized := strings.ToLower(strings.TrimSpace(toolName))
+	normalized := NormalizeName(toolName)
 	e.limiterMu.Lock()
 	defer e.limiterMu.Unlock()
 
@@ -739,4 +1080,118 @@ func (e *Engine) ResetAllLimiters() {
 			e.limiters[normalized] = rate.NewLimiter(rule.parsedRateLimit, rule.parsedBurst)
 		}
 	}
+}
+
+// -----------------------------------------------------------------------------
+// Method-Level Authorization (First Line of Defense)
+// -----------------------------------------------------------------------------
+
+// MethodDecision contains the result of a method-level authorization check.
+// This is checked BEFORE tool-level policy to prevent bypass attacks via
+// uncontrolled MCP methods like resources/read or prompts/get.
+type MethodDecision struct {
+	// Allowed indicates if the method should be permitted.
+	Allowed bool
+
+	// Reason provides a human-readable explanation of the decision.
+	Reason string
+}
+
+// IsMethodAllowed checks if a JSON-RPC method is permitted by policy.
+//
+// This is the FIRST line of defense, checked before tool-level policy.
+// It prevents bypass attacks where an attacker uses MCP methods that aren't
+// subject to tool-level checks (e.g., resources/read, prompts/get).
+//
+// The check flow is:
+//  1. Check if method is in denied_methods → DENY
+//  2. Check if "*" wildcard is in allowed_methods → ALLOW
+//  3. Check if method is in allowed_methods → ALLOW
+//  4. Otherwise → DENY (fail-closed)
+//
+// Method names are normalized to lowercase for case-insensitive matching.
+// This prevents bypass via "Resources/Read" vs "resources/read".
+//
+// Example:
+//
+//	decision := engine.IsMethodAllowed("resources/read")
+//	if !decision.Allowed {
+//	    // Return -32006 Method Not Allowed error
+//	}
+func (e *Engine) IsMethodAllowed(method string) MethodDecision {
+	// Normalize using Unicode-safe normalization
+	// This prevents bypass attacks via fullwidth chars, etc.
+	normalized := NormalizeName(method)
+
+	// No policy loaded = use defaults (fail-open for basic MCP methods)
+	if e.allowedMethods == nil && e.deniedMethods == nil {
+		for _, m := range DefaultAllowedMethods {
+			if strings.ToLower(m) == normalized {
+				return MethodDecision{
+					Allowed: true,
+					Reason:  "method in default allowlist (no policy loaded)",
+				}
+			}
+		}
+		return MethodDecision{
+			Allowed: false,
+			Reason:  "method not in default allowlist (no policy loaded)",
+		}
+	}
+
+	// Step 1: Check deny list first (takes precedence)
+	if _, denied := e.deniedMethods[normalized]; denied {
+		return MethodDecision{
+			Allowed: false,
+			Reason:  "method explicitly denied by denied_methods",
+		}
+	}
+
+	// Step 2: Check for wildcard (allows everything not denied)
+	if _, ok := e.allowedMethods["*"]; ok {
+		return MethodDecision{
+			Allowed: true,
+			Reason:  "wildcard '*' in allowed_methods permits all methods",
+		}
+	}
+
+	// Step 3: Check if method is in allowed list
+	if _, allowed := e.allowedMethods[normalized]; allowed {
+		return MethodDecision{
+			Allowed: true,
+			Reason:  "method in allowed_methods",
+		}
+	}
+
+	// Step 4: Default deny (fail-closed)
+	return MethodDecision{
+		Allowed: false,
+		Reason:  fmt.Sprintf("method %q not in allowed_methods", method),
+	}
+}
+
+// GetAllowedMethods returns a copy of the allowed methods list for inspection.
+func (e *Engine) GetAllowedMethods() []string {
+	if e.allowedMethods == nil {
+		return DefaultAllowedMethods
+	}
+
+	result := make([]string, 0, len(e.allowedMethods))
+	for method := range e.allowedMethods {
+		result = append(result, method)
+	}
+	return result
+}
+
+// GetDeniedMethods returns a copy of the denied methods list for inspection.
+func (e *Engine) GetDeniedMethods() []string {
+	if e.deniedMethods == nil {
+		return nil
+	}
+
+	result := make([]string, 0, len(e.deniedMethods))
+	for method := range e.deniedMethods {
+		result = append(result, method)
+	}
+	return result
 }

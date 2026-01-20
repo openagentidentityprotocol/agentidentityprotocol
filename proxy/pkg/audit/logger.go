@@ -38,6 +38,8 @@ const (
 	DecisionBlock Decision = "BLOCK"
 	// DecisionAllowMonitor - Would be blocked, but monitor mode allowed passthrough
 	DecisionAllowMonitor Decision = "ALLOW_MONITOR"
+	// DecisionRateLimited - Request denied due to rate limit exceeded
+	DecisionRateLimited Decision = "RATE_LIMITED"
 )
 
 // PolicyMode represents the enforcement mode of the policy.

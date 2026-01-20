@@ -4,11 +4,11 @@
 </p>
 
 <p align="center">
-  <a href="https://goreportcard.com/report/github.com/ArangoGutierrez/agent-identity-protocol"><img src="https://goreportcard.com/badge/github.com/ArangoGutierrez/agent-identity-protocol" alt="Go Report Card"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License"></a>
-  <a href="https://github.com/ArangoGutierrez/agent-identity-protocol/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/ArangoGutierrez/agent-identity-protocol/ci.yml?label=Build" alt="Build Status"></a>
-  <a href="https://securityscorecards.dev/viewer/?uri=github.com/ArangoGutierrez/agent-identity-protocol"><img src="https://img.shields.io/badge/Security-Hardened-green" alt="Security"></a>
-  <a href="https://twitter.com/ArangoGutworker"><img src="https://img.shields.io/twitter/follow/ArangoGutworker?style=social" alt="Twitter Follow"></a>
+  <a href="https://goreportcard.com/report/github.com/ArangoGutierrez/agent-identity-protocol"><img src="https://img.shields.io/badge/Go%20Report%20Card-A+-brightgreen?style=flat&logo=go" alt="Go Report Card: A+"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License: Apache 2.0"></a>
+  <a href="https://github.com/ArangoGutierrez/agent-identity-protocol/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/ArangoGutierrez/agent-identity-protocol/ci.yml?label=Build&logo=github" alt="Build: Passing"></a>
+  <a href="https://securityscorecards.dev/viewer/?uri=github.com/ArangoGutierrez/agent-identity-protocol"><img src="https://img.shields.io/badge/Security-Hardened-success?logo=shield" alt="Security: Hardened"></a>
+  <a href="https://twitter.com/ArangoGutworker"><img src="https://img.shields.io/twitter/follow/ArangoGutworker?style=social&logo=x" alt="Follow @ArangoGutworker"></a>
 </p>
 
 ---
@@ -17,7 +17,7 @@
 
 Today's AI agents operate with **unrestricted access** to your infrastructure. When you connect Claude, Cursor, or any MCP-compatible agent to your systems, it receives *god mode*—full access to every tool the server exposes.
 
-Model safety isn't enough. **Indirect Prompt Injection** attacks—like [GeminiJack](https://embrace-the-red.com/blog/gemini-jack/)—have proven that adversarial instructions embedded in documents, emails, or data can hijack agent behavior. The model *believes* it's following your intent while executing the attacker's commands.
+**Model safety isn't enough.** Attacks like **Indirect Prompt Injection**—demonstrated by the [GeminiJack vulnerability](https://embrace-the-red.com/blog/gemini-jack/)—have proven that adversarial instructions embedded in documents, emails, or data can hijack agent behavior. The model *believes* it's following your intent while executing the attacker's commands.
 
 Your agent is one poisoned PDF away from `rm -rf /`.
 
@@ -35,27 +35,27 @@ AIP operates as a transparent proxy between the AI client (Cursor, Claude, VS Co
 
 ```mermaid
 graph LR
-    subgraph Client
-        A[🤖 Cursor / Claude]
+    subgraph Client["🤖 AI Client"]
+        A[Cursor / Claude Desktop]
     end
     
-    subgraph AIP["🛡️ AIP Proxy"]
+    subgraph AIP["🛡️ AIP Proxy (Sidecar)"]
         B[Policy Engine]
         C[DLP Scanner]
         D[Audit Log]
     end
     
-    subgraph Server
-        E[🔧 Docker / Postgres / GitHub]
+    subgraph Server["🔧 Real Tool"]
+        E[Docker / Postgres / GitHub]
     end
     
-    A -->|tools/call| B
-    B -->|ALLOW| E
-    B -->|DENY| A
+    A -->|"tools/call"| B
+    B -->|"✅ ALLOW"| E
+    B -->|"🔴 DENY"| A
     B --> C
     C --> D
-    E -->|response| C
-    C -->|filtered| A
+    E -->|"response"| C
+    C -->|"filtered"| A
     
     style B fill:#22c55e,stroke:#16a34a,stroke-width:2px,color:#fff
     style AIP fill:#f0fdf4,stroke:#16a34a,stroke-width:3px
@@ -75,10 +75,10 @@ sequenceDiagram
     Agent->>AIP: tools/call "delete_database"
     AIP->>Policy: Check allowed_tools
     Policy-->>AIP: ❌ Not in allowlist
-    AIP->>AIP: Decision: BLOCK
-    AIP-->>Agent: Error: -32001 Forbidden
-    Note over Tool: Never receives request
-    Note over AIP: Logged to audit trail
+    AIP->>AIP: 🔴 Decision: DENY
+    AIP-->>Agent: Error: -32001 Permission Denied
+    Note over Tool: ⚠️ Never receives request
+    Note over AIP: 📝 Logged to audit trail
 ```
 
 ---
@@ -101,7 +101,7 @@ sequenceDiagram
 Secure any MCP tool server in one command:
 
 ```bash
-# Wrap your Docker MCP server with a read-only policy
+# Secure your local Docker MCP
 aip wrap docker --policy ./policies/read-only.yaml
 ```
 
@@ -141,19 +141,6 @@ spec:
 
 ---
 
-## Documentation
-
-| Resource | Description |
-|----------|-------------|
-| [AIP Specification](spec/aip-v1alpha1.md) | Formal protocol definition (v1alpha1) |
-| [Policy Reference](docs/policy-reference.md) | Complete YAML schema |
-| [Go Proxy README](implementations/go-proxy/README.md) | Reference implementation |
-| [Quickstart Guide](implementations/go-proxy/docs/quickstart.md) | 5-minute tutorial |
-| [Why AIP?](docs/why-aip.md) | Threat model and design rationale |
-| [FAQ](docs/faq.md) | Common questions |
-
----
-
 ## Roadmap
 
 We're building a **standard**, not just a tool.
@@ -171,31 +158,23 @@ We're building a **standard**, not just a tool.
   - NetworkPolicy integration
   - Prometheus metrics
 
-- [ ] **v1.0: Federation** — Enterprise Identity
-  - OIDC / SPIFFE identity federation
+- [ ] **v1.0: OIDC / SPIFFE Federation** — Enterprise Identity
+  - Workload identity federation
   - Centralized policy management
   - Multi-tenant audit aggregation
 
 ---
 
-## Repository Structure
+## Documentation
 
-```
-agent-identity-protocol/
-├── spec/                        # THE PROTOCOL
-│   ├── aip-v1alpha1.md          # Specification document
-│   ├── schema/                  # JSON Schema for validation
-│   └── conformance/             # Test suite for implementations
-├── implementations/             # IMPLEMENTATIONS
-│   └── go-proxy/                # Reference implementation (Go)
-│       ├── cmd/aip-proxy/       # Main binary
-│       ├── pkg/                 # Libraries (policy, dlp, audit, ui)
-│       └── examples/            # Example policies
-└── docs/                        # DOCUMENTATION
-    ├── why-aip.md               # Problem statement
-    ├── policy-reference.md      # Policy YAML reference
-    └── faq.md                   # Common questions
-```
+| Resource | Description |
+|----------|-------------|
+| [AIP Specification](spec/aip-v1alpha1.md) | Formal protocol definition (v1alpha1) |
+| [Policy Reference](docs/policy-reference.md) | Complete YAML schema |
+| [Go Proxy README](implementations/go-proxy/README.md) | Reference implementation |
+| [Quickstart Guide](implementations/go-proxy/docs/quickstart.md) | 5-minute tutorial |
+| [Why AIP?](docs/why-aip.md) | Threat model and design rationale |
+| [FAQ](docs/faq.md) | Common questions |
 
 ---
 

@@ -14,6 +14,7 @@
 package policy
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"regexp"
@@ -642,17 +643,27 @@ func (e *Engine) makeDecision(wouldAllow bool, reason, failedArg, failedRule str
 
 // argToString converts an argument value to string for regex matching.
 // Handles common JSON types: string, number, bool.
+// Complex types (slices, maps) are marshaled to JSON to ensure deterministic matching.
 func argToString(v any) string {
 	switch val := v.(type) {
 	case string:
 		return val
 	case float64:
-		return fmt.Sprintf("%v", val)
+		// Use -1 to format minimal decimal digits needed
+		return strconv.FormatFloat(val, 'f', -1, 64)
 	case int:
-		return fmt.Sprintf("%d", val)
+		return strconv.Itoa(val)
 	case bool:
-		return fmt.Sprintf("%t", val)
+		return strconv.FormatBool(val)
+	case nil:
+		return ""
 	default:
+		// Fallback for complex types: JSON representation
+		// This ensures []string{"a", "b"} becomes `["a","b"]` instead of `[a b]`
+		if b, err := json.Marshal(v); err == nil {
+			return string(b)
+		}
+		// Last resort fallback
 		return fmt.Sprintf("%v", val)
 	}
 }

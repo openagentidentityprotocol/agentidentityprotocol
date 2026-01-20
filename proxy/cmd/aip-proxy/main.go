@@ -486,6 +486,20 @@ func (p *Proxy) handleUpstream() {
 
 				// Handle the decision based on mode
 				if !decision.Allowed {
+					// Check for rate limiting first
+					if decision.Action == policy.ActionRateLimited {
+						p.logger.Printf("RATE_LIMITED: Tool %q exceeded rate limit", toolName)
+						p.auditLogger.LogToolCall(
+							toolName,
+							toolArgs,
+							audit.DecisionRateLimited,
+							true,
+							"",
+							"",
+						)
+						p.sendErrorResponse(protocol.NewRateLimitedError(req.ID, toolName))
+						continue // Do not forward to subprocess
+					}
 					// BLOCKED (enforce mode with violation)
 					if decision.FailedArg != "" {
 						p.logger.Printf("BLOCKED: Tool %q argument %q failed validation (pattern: %s)",

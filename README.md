@@ -1,9 +1,11 @@
 # Agent Identity Protocol (AIP)
 
-**The Zero-Trust Identity Layer for Autonomous Agents**
+**"Sudo for AI Agents" — The Zero-Trust Security Layer for Autonomous Agents**
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Status](https://img.shields.io/badge/Status-RFC-yellow.svg)]()
+[![Go Version](https://img.shields.io/badge/Go-1.23+-00ADD8?logo=go)](https://go.dev/)
+[![CI](https://github.com/ArangoGutierrez/agent-identity-protocol/actions/workflows/ci.yml/badge.svg)](https://github.com/ArangoGutierrez/agent-identity-protocol/actions/workflows/ci.yml)
+[![Status](https://img.shields.io/badge/Status-Alpha-orange.svg)]()
 
 ---
 
@@ -262,14 +264,41 @@ Every tool call is logged with full context for forensic analysis:
 
 ## Roadmap
 
-- [x] **Specification v0.1**: Core manifest schema and policy semantics
+### Completed
 - [x] **v0.1: Local Proxy** — Single-binary proxy for local development
+- [x] **Policy Engine** — Declarative YAML policies with tool allowlists
+- [x] **Human-in-the-Loop** — Native OS prompts for sensitive operations
+- [x] **DLP Scanner** — Redact sensitive data in tool responses
+- [x] **Audit Logging** — Immutable JSONL audit trail
+- [x] **Cursor Integration** — `--generate-cursor-config` for easy setup
+- [x] **Rate Limiting** — Per-tool rate limits
+- [x] **Monitor Mode** — Dry-run policy testing
+
+### In Progress
 - [ ] **v0.2: Kubernetes Sidecar** — Inject AIP as a sidecar container
+- [ ] **Helm Chart** — Easy Kubernetes deployment
+
+### Planned
 - [ ] **v0.3: MCP Integration** — Native MCP transport with AIP policy layer
 - [ ] **v0.4: Multi-Agent Support** — Agent-to-agent authentication and delegation
 - [ ] **v1.0: OIDC Federation** — Full identity provider integration (Okta, Auth0, Google)
 - [ ] **v1.1: Policy Language** — Rego/CEL support for complex authorization rules
 - [ ] **v1.2: Observability Stack** — Prometheus metrics, OpenTelemetry traces
+- [ ] **VS Code Extension** — Native VS Code integration
+
+---
+
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [Quickstart](docs/quickstart.md) | Get running in 5 minutes |
+| [Architecture](docs/architecture.md) | Deep dive into AIP design |
+| [Policy Reference](docs/policy-reference.md) | Complete YAML schema |
+| [Integration Guide](docs/integration-guide.md) | Cursor, VS Code, Claude Desktop |
+| [Contributing](CONTRIBUTING.md) | How to contribute |
+| [Security](SECURITY.md) | Vulnerability reporting |
+| [Changelog](CHANGELOG.md) | Release history |
 
 ---
 
@@ -277,36 +306,53 @@ Every tool call is logged with full context for forensic analysis:
 
 ```
 agent-identity-protocol/
-├── spec/                    # Protocol specification (RFC-style)
-│   ├── aip-spec.md
-│   └── manifest-schema.json
 ├── proxy/                   # Go implementation of AIP proxy
-│   ├── cmd/
+│   ├── cmd/aip-proxy/       # Main entry point
 │   ├── pkg/
-│   └── go.mod
-├── sdk/                     # Client SDKs
-│   ├── python/
-│   └── typescript/
-├── examples/                # Reference implementations
-│   ├── code-review-agent/
-│   └── data-analyst-agent/
-├── deploy/                  # Deployment configurations
-│   ├── kubernetes/
-│   └── docker-compose.yaml
-└── docs/                    # Extended documentation
+│   │   ├── audit/           # JSONL audit logging
+│   │   ├── dlp/             # Data Loss Prevention scanner
+│   │   ├── policy/          # Policy engine
+│   │   ├── protocol/        # JSON-RPC types
+│   │   └── ui/              # Human-in-the-loop prompts
+│   ├── examples/            # Example policies
+│   ├── test/                # Test fixtures
+│   └── Makefile
+├── docs/                    # Extended documentation
+│   ├── quickstart.md
+│   ├── architecture.md
+│   ├── policy-reference.md
+│   └── integration-guide.md
+├── scripts/                 # Utility scripts
+└── .github/                 # CI/CD, templates, configs
+    ├── workflows/
+    ├── ISSUE_TEMPLATE/
+    └── PULL_REQUEST_TEMPLATE.md
 ```
 
 ---
 
 ## Getting Started
 
-```bash
-# Build the proxy
-cd proxy
-go build -o aip-proxy ./cmd/aip-proxy
+### Quick Install
 
+```bash
+# Clone and build
+git clone https://github.com/ArangoGutierrez/agent-identity-protocol.git
+cd agent-identity-protocol/proxy
+make build
+
+# Verify installation
+./bin/aip --help
+```
+
+### Basic Usage
+
+```bash
 # Run with a policy file and target MCP server
-./aip-proxy --policy agent.yaml --target "python3 mcp_server.py"
+./bin/aip --policy examples/agent.yaml --target "python3 mcp_server.py"
+
+# Verbose mode for debugging
+./bin/aip --policy examples/agent.yaml --target "npx @mcp/server" --verbose
 ```
 
 **See the full walkthrough:** [Quickstart Guide](docs/quickstart.md) — includes a working test with a dummy MCP server.
@@ -317,7 +363,76 @@ go build -o aip-proxy ./cmd/aip-proxy
 |------|-------------|---------|
 | `--target` | Command to run as MCP server (required) | — |
 | `--policy` | Path to agent.yaml policy file | `agent.yaml` |
+| `--audit` | Path to audit log file | `aip-audit.jsonl` |
 | `--verbose` | Enable detailed logging | `false` |
+| `--generate-cursor-config` | Output Cursor IDE config JSON | `false` |
+
+---
+
+## The "Sudo for AI" Demo
+
+This is how you prove AIP works. We'll wrap a GPU/Kubernetes MCP server with policy enforcement and see interactive approval in action.
+
+### Step 1: Create a Policy
+
+```yaml
+# gpu-policy.yaml
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: gpu-policy
+spec:
+  mode: enforce
+  allowed_tools:
+    - list_gpus
+    - get_gpu_metrics
+  tool_rules:
+    - tool: list_gpus
+      rate_limit: "10/minute"
+    - tool: run_training
+      action: ask  # Interactive popup!
+    - tool: delete_resources
+      action: block
+```
+
+### Step 2: Generate Cursor Config
+
+```bash
+./bin/aip --generate-cursor-config \
+  --policy ./gpu-policy.yaml \
+  --target "/path/to/your/k8s-gpu-mcp-server"
+```
+
+Output:
+```json
+{
+  "mcpServers": {
+    "protected-tool": {
+      "command": "/path/to/aip",
+      "args": [
+        "--policy", "/path/to/gpu-policy.yaml",
+        "--target", "/path/to/your/k8s-gpu-mcp-server"
+      ]
+    }
+  }
+}
+```
+
+### Step 3: Add to Cursor
+
+Paste the JSON into `~/.cursor/mcp.json` and restart Cursor.
+
+### Step 4: The Demo
+
+| You Ask | What Happens | Result |
+|---------|--------------|--------|
+| "List my GPUs" | Tool: `list_gpus` → Allowed | ✅ Success |
+| "Run a training job" | Tool: `run_training` → Popup: "Allow?" | 🔔 User decides |
+| Click "Deny" | Request blocked | ❌ "User Denied" |
+| Click "Allow" | Request forwarded | ✅ Training starts |
+| "Delete all pods" | Tool: `delete_resources` → Policy block | ❌ "Forbidden by policy" |
+
+**You just gave your AI agent a permission system.** Every sensitive action requires explicit approval.
 
 ---
 

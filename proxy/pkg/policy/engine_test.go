@@ -857,3 +857,427 @@ spec:
 		t.Errorf("Action = %q, want %q", decision.Action, ActionBlock)
 	}
 }
+
+// -----------------------------------------------------------------------------
+// Rate Limiting Tests (Phase 6)
+// -----------------------------------------------------------------------------
+
+// TestParseRateLimit tests parsing of rate limit strings.
+func TestParseRateLimit(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		wantLimit float64 // approximate rate per second
+		wantBurst int
+		wantErr   bool
+	}{
+		{
+			name:      "Empty string - no rate limiting",
+			input:     "",
+			wantLimit: 0,
+			wantBurst: 0,
+			wantErr:   false,
+		},
+		{
+			name:      "5 per second",
+			input:     "5/second",
+			wantLimit: 5.0,
+			wantBurst: 5,
+			wantErr:   false,
+		},
+		{
+			name:      "5 per sec (short form)",
+			input:     "5/sec",
+			wantLimit: 5.0,
+			wantBurst: 5,
+			wantErr:   false,
+		},
+		{
+			name:      "60 per minute",
+			input:     "60/minute",
+			wantLimit: 1.0, // 60/60 = 1 per second
+			wantBurst: 60,
+			wantErr:   false,
+		},
+		{
+			name:      "2 per minute",
+			input:     "2/minute",
+			wantLimit: 2.0 / 60.0,
+			wantBurst: 2,
+			wantErr:   false,
+		},
+		{
+			name:      "3600 per hour",
+			input:     "3600/hour",
+			wantLimit: 1.0, // 3600/3600 = 1 per second
+			wantBurst: 3600,
+			wantErr:   false,
+		},
+		{
+			name:      "100 per hour",
+			input:     "100/hour",
+			wantLimit: 100.0 / 3600.0,
+			wantBurst: 100,
+			wantErr:   false,
+		},
+		{
+			name:    "Invalid format - no slash",
+			input:   "5minute",
+			wantErr: true,
+		},
+		{
+			name:    "Invalid format - too many slashes",
+			input:   "5/per/minute",
+			wantErr: true,
+		},
+		{
+			name:    "Invalid count - not a number",
+			input:   "abc/minute",
+			wantErr: true,
+		},
+		{
+			name:    "Invalid count - zero",
+			input:   "0/minute",
+			wantErr: true,
+		},
+		{
+			name:    "Invalid count - negative",
+			input:   "-5/minute",
+			wantErr: true,
+		},
+		{
+			name:    "Invalid duration",
+			input:   "5/day",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			limit, burst, err := ParseRateLimit(tt.input)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("ParseRateLimit(%q) expected error, got nil", tt.input)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Errorf("ParseRateLimit(%q) unexpected error: %v", tt.input, err)
+				return
+			}
+
+			if burst != tt.wantBurst {
+				t.Errorf("ParseRateLimit(%q) burst = %d, want %d", tt.input, burst, tt.wantBurst)
+			}
+
+			// Compare limits with some tolerance for floating point
+			gotLimit := float64(limit)
+			if gotLimit < tt.wantLimit*0.99 || gotLimit > tt.wantLimit*1.01 {
+				t.Errorf("ParseRateLimit(%q) limit = %f, want %f", tt.input, gotLimit, tt.wantLimit)
+			}
+		})
+	}
+}
+
+// TestRateLimitEnforcement tests that rate limits are enforced correctly.
+// This is the key test: "2/minute" should allow first 2 calls, block subsequent.
+func TestRateLimitEnforcement(t *testing.T) {
+	policyYAML := `
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: rate-limit-test
+spec:
+  tool_rules:
+    - tool: fast_tool
+      rate_limit: "2/minute"
+`
+
+	engine := NewEngine()
+	if err := engine.Load([]byte(policyYAML)); err != nil {
+		t.Fatalf("Failed to load policy: %v", err)
+	}
+
+	// Simulate 5 rapid calls to fast_tool
+	// First 2 should succeed (burst), remaining 3 should be rate limited
+	var allowed, rateLimited int
+
+	for i := 0; i < 5; i++ {
+		decision := engine.IsAllowed("fast_tool", nil)
+
+		if decision.Allowed {
+			allowed++
+		} else if decision.Action == ActionRateLimited {
+			rateLimited++
+			// Verify the error message format
+			if decision.Reason == "" {
+				t.Errorf("Call %d: Rate limited but no reason provided", i+1)
+			}
+		} else {
+			t.Errorf("Call %d: Unexpected action %q", i+1, decision.Action)
+		}
+	}
+
+	// Assert: first 2 succeed, next 3 fail
+	if allowed != 2 {
+		t.Errorf("Expected 2 allowed calls, got %d", allowed)
+	}
+	if rateLimited != 3 {
+		t.Errorf("Expected 3 rate limited calls, got %d", rateLimited)
+	}
+}
+
+// TestRateLimitPerTool tests that rate limits are per-tool, not global.
+func TestRateLimitPerTool(t *testing.T) {
+	policyYAML := `
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: per-tool-rate-limit-test
+spec:
+  allowed_tools:
+    - unlimited_tool
+  tool_rules:
+    - tool: limited_tool
+      rate_limit: "1/minute"
+`
+
+	engine := NewEngine()
+	if err := engine.Load([]byte(policyYAML)); err != nil {
+		t.Fatalf("Failed to load policy: %v", err)
+	}
+
+	// First call to limited_tool should succeed
+	decision := engine.IsAllowed("limited_tool", nil)
+	if !decision.Allowed {
+		t.Error("First call to limited_tool should be allowed")
+	}
+
+	// Second call should be rate limited
+	decision = engine.IsAllowed("limited_tool", nil)
+	if decision.Allowed || decision.Action != ActionRateLimited {
+		t.Error("Second call to limited_tool should be rate limited")
+	}
+
+	// Calls to unlimited_tool should still work (no rate limit)
+	for i := 0; i < 10; i++ {
+		decision = engine.IsAllowed("unlimited_tool", nil)
+		if !decision.Allowed {
+			t.Errorf("Call %d to unlimited_tool should be allowed", i+1)
+		}
+	}
+}
+
+// TestRateLimitWithArgValidation tests that rate limits and arg validation work together.
+func TestRateLimitWithArgValidation(t *testing.T) {
+	policyYAML := `
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: rate-limit-with-args-test
+spec:
+  tool_rules:
+    - tool: api_tool
+      rate_limit: "2/minute"
+      allow_args:
+        endpoint: "^/api/.*"
+`
+
+	engine := NewEngine()
+	if err := engine.Load([]byte(policyYAML)); err != nil {
+		t.Fatalf("Failed to load policy: %v", err)
+	}
+
+	// Call 1: Valid args - should succeed
+	decision := engine.IsAllowed("api_tool", map[string]any{"endpoint": "/api/users"})
+	if !decision.Allowed {
+		t.Errorf("Call 1 should be allowed, got action=%s, reason=%s", decision.Action, decision.Reason)
+	}
+
+	// Call 2: Valid args - should succeed (within burst)
+	decision = engine.IsAllowed("api_tool", map[string]any{"endpoint": "/api/orders"})
+	if !decision.Allowed {
+		t.Errorf("Call 2 should be allowed, got action=%s, reason=%s", decision.Action, decision.Reason)
+	}
+
+	// Call 3: Even with valid args - should be rate limited
+	decision = engine.IsAllowed("api_tool", map[string]any{"endpoint": "/api/products"})
+	if decision.Allowed || decision.Action != ActionRateLimited {
+		t.Errorf("Call 3 should be rate limited, got action=%s", decision.Action)
+	}
+}
+
+// TestRateLimitDecisionFields tests that rate limited decisions have correct fields.
+func TestRateLimitDecisionFields(t *testing.T) {
+	policyYAML := `
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: rate-limit-fields-test
+spec:
+  tool_rules:
+    - tool: test_tool
+      rate_limit: "1/minute"
+`
+
+	engine := NewEngine()
+	if err := engine.Load([]byte(policyYAML)); err != nil {
+		t.Fatalf("Failed to load policy: %v", err)
+	}
+
+	// Exhaust the rate limit
+	_ = engine.IsAllowed("test_tool", nil) // First call succeeds
+
+	// Second call should be rate limited
+	decision := engine.IsAllowed("test_tool", nil)
+
+	// Verify all decision fields
+	if decision.Allowed {
+		t.Error("Allowed should be false")
+	}
+	if decision.Action != ActionRateLimited {
+		t.Errorf("Action should be %q, got %q", ActionRateLimited, decision.Action)
+	}
+	if !decision.ViolationDetected {
+		t.Error("ViolationDetected should be true")
+	}
+	if decision.Reason == "" {
+		t.Error("Reason should not be empty")
+	}
+	if !containsSubstring(decision.Reason, "rate limit") {
+		t.Errorf("Reason should mention rate limit, got: %s", decision.Reason)
+	}
+}
+
+// TestInvalidRateLimitReturnsError tests that invalid rate limit values cause Load() to fail.
+func TestInvalidRateLimitReturnsError(t *testing.T) {
+	tests := []struct {
+		name       string
+		rateLimit  string
+		wantErrMsg string
+	}{
+		{
+			name:       "Invalid format",
+			rateLimit:  "invalid",
+			wantErrMsg: "invalid rate_limit",
+		},
+		{
+			name:       "Invalid duration",
+			rateLimit:  "5/week",
+			wantErrMsg: "invalid rate_limit",
+		},
+		{
+			name:       "Zero count",
+			rateLimit:  "0/minute",
+			wantErrMsg: "invalid rate_limit",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			policyYAML := `
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: invalid-rate-limit-test
+spec:
+  tool_rules:
+    - tool: test_tool
+      rate_limit: "` + tt.rateLimit + `"
+`
+			engine := NewEngine()
+			err := engine.Load([]byte(policyYAML))
+
+			if err == nil {
+				t.Error("Expected Load() to fail with invalid rate_limit, but it succeeded")
+			} else if !containsSubstring(err.Error(), tt.wantErrMsg) {
+				t.Errorf("Error message should contain %q, got: %v", tt.wantErrMsg, err)
+			}
+		})
+	}
+}
+
+// TestResetLimiter tests that rate limiters can be reset.
+func TestResetLimiter(t *testing.T) {
+	policyYAML := `
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: reset-limiter-test
+spec:
+  tool_rules:
+    - tool: test_tool
+      rate_limit: "1/minute"
+`
+
+	engine := NewEngine()
+	if err := engine.Load([]byte(policyYAML)); err != nil {
+		t.Fatalf("Failed to load policy: %v", err)
+	}
+
+	// Exhaust the rate limit
+	decision := engine.IsAllowed("test_tool", nil)
+	if !decision.Allowed {
+		t.Error("First call should be allowed")
+	}
+
+	decision = engine.IsAllowed("test_tool", nil)
+	if decision.Allowed {
+		t.Error("Second call should be rate limited")
+	}
+
+	// Reset the limiter
+	engine.ResetLimiter("test_tool")
+
+	// Now it should work again
+	decision = engine.IsAllowed("test_tool", nil)
+	if !decision.Allowed {
+		t.Error("After reset, call should be allowed")
+	}
+}
+
+// TestRateLimitCaseInsensitive tests that rate limits work case-insensitively.
+func TestRateLimitCaseInsensitive(t *testing.T) {
+	policyYAML := `
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: case-insensitive-test
+spec:
+  tool_rules:
+    - tool: Test_Tool
+      rate_limit: "1/minute"
+`
+
+	engine := NewEngine()
+	if err := engine.Load([]byte(policyYAML)); err != nil {
+		t.Fatalf("Failed to load policy: %v", err)
+	}
+
+	// Call with different case - should hit the same limiter
+	decision := engine.IsAllowed("TEST_TOOL", nil)
+	if !decision.Allowed {
+		t.Error("First call should be allowed")
+	}
+
+	decision = engine.IsAllowed("test_tool", nil)
+	if decision.Action != ActionRateLimited {
+		t.Error("Second call with different case should be rate limited")
+	}
+}
+
+// containsSubstring is a helper to check if a string contains a substring.
+func containsSubstring(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsSubstringHelper(s, substr))
+}
+
+func containsSubstringHelper(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}

@@ -101,6 +101,51 @@ type PolicySpec struct {
 	//   - Understanding agent behavior in production
 	//   - Gradual policy rollout
 	Mode string `yaml:"mode,omitempty"`
+
+	// DLP (Data Loss Prevention) configuration for output redaction.
+	// When enabled, the proxy scans downstream responses from the tool
+	// and redacts sensitive information (PII, API keys, secrets) before
+	// forwarding to the client.
+	DLP *DLPConfig `yaml:"dlp,omitempty"`
+}
+
+// DLPConfig configures Data Loss Prevention (output redaction) rules.
+//
+// Example YAML:
+//
+//	dlp:
+//	  enabled: true
+//	  patterns:
+//	    - name: "Email"
+//	      regex: "[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"
+//	    - name: "AWS Key"
+//	      regex: "(A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}"
+type DLPConfig struct {
+	// Enabled controls whether DLP scanning is active (default: true if dlp block exists)
+	Enabled *bool `yaml:"enabled,omitempty"`
+
+	// Patterns defines the sensitive data patterns to detect and redact.
+	Patterns []DLPPattern `yaml:"patterns"`
+}
+
+// DLPPattern defines a single sensitive data detection rule.
+type DLPPattern struct {
+	// Name is a human-readable identifier for the pattern (used in redaction placeholder)
+	Name string `yaml:"name"`
+
+	// Regex is the pattern to match sensitive data
+	Regex string `yaml:"regex"`
+}
+
+// IsEnabled returns true if DLP scanning is enabled.
+func (d *DLPConfig) IsEnabled() bool {
+	if d == nil {
+		return false
+	}
+	if d.Enabled == nil {
+		return true // Default to enabled if dlp block exists
+	}
+	return *d.Enabled
 }
 
 // ToolRule defines argument-level validation for a specific tool.
@@ -641,6 +686,15 @@ func (e *Engine) GetAllowedTools() []string {
 	result := make([]string, len(e.policy.Spec.AllowedTools))
 	copy(result, e.policy.Spec.AllowedTools)
 	return result
+}
+
+// GetDLPConfig returns the DLP configuration from the policy.
+// Returns nil if no DLP config is defined.
+func (e *Engine) GetDLPConfig() *DLPConfig {
+	if e.policy == nil {
+		return nil
+	}
+	return e.policy.Spec.DLP
 }
 
 // getLimiter returns the rate limiter for a tool, or nil if none configured.

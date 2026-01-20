@@ -1056,7 +1056,9 @@ Stack trace:
   at AWSClient.connect(key=AKIAIOSFODNN7EXAMPLE)
   at main.py:42
 `
-	filtered.Write([]byte(stderrOutput))
+	if _, err := filtered.Write([]byte(stderrOutput)); err != nil {
+		t.Fatalf("Failed to write to filtered writer: %v", err)
+	}
 
 	output := buf.String()
 

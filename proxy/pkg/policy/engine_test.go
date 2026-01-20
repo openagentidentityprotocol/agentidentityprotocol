@@ -582,3 +582,278 @@ spec:
 		t.Error("Decision.Reason should not be empty for allowed tools")
 	}
 }
+
+// -----------------------------------------------------------------------------
+// Human-in-the-Loop (ASK Action) Tests (Phase 5)
+// -----------------------------------------------------------------------------
+
+// TestAskActionReturnsAskDecision tests that action="ask" returns a Decision
+// with Action=ActionAsk, requiring user approval.
+func TestAskActionReturnsAskDecision(t *testing.T) {
+	policyYAML := `
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: ask-action-test
+spec:
+  tool_rules:
+    - tool: dangerous_tool
+      action: ask
+`
+
+	engine := NewEngine()
+	if err := engine.Load([]byte(policyYAML)); err != nil {
+		t.Fatalf("Failed to load policy: %v", err)
+	}
+
+	decision := engine.IsAllowed("dangerous_tool", nil)
+
+	if decision.Action != ActionAsk {
+		t.Errorf("Action = %q, want %q", decision.Action, ActionAsk)
+	}
+	if decision.Allowed {
+		t.Error("Allowed should be false for ASK decision (requires user approval)")
+	}
+	if decision.ViolationDetected {
+		t.Error("ViolationDetected should be false for ASK (not a policy violation)")
+	}
+}
+
+// TestBlockActionReturnsBlockDecision tests that action="block" unconditionally
+// blocks the tool call.
+func TestBlockActionReturnsBlockDecision(t *testing.T) {
+	policyYAML := `
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: block-action-test
+spec:
+  tool_rules:
+    - tool: forbidden_tool
+      action: block
+`
+
+	engine := NewEngine()
+	if err := engine.Load([]byte(policyYAML)); err != nil {
+		t.Fatalf("Failed to load policy: %v", err)
+	}
+
+	decision := engine.IsAllowed("forbidden_tool", nil)
+
+	if decision.Action != ActionBlock {
+		t.Errorf("Action = %q, want %q", decision.Action, ActionBlock)
+	}
+	if decision.Allowed {
+		t.Error("Allowed should be false for BLOCK decision")
+	}
+	if !decision.ViolationDetected {
+		t.Error("ViolationDetected should be true for BLOCK")
+	}
+}
+
+// TestAskActionWithArgValidation tests that action="ask" still validates
+// arguments before prompting the user.
+func TestAskActionWithArgValidation(t *testing.T) {
+	policyYAML := `
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: ask-with-args-test
+spec:
+  tool_rules:
+    - tool: sensitive_tool
+      action: ask
+      allow_args:
+        target: "^(staging|prod)$"
+`
+
+	engine := NewEngine()
+	if err := engine.Load([]byte(policyYAML)); err != nil {
+		t.Fatalf("Failed to load policy: %v", err)
+	}
+
+	tests := []struct {
+		name           string
+		args           map[string]any
+		wantAction     string
+		wantAllowed    bool
+		wantViolation  bool
+		wantFailedArg  string
+	}{
+		{
+			name:           "Valid args returns ASK",
+			args:           map[string]any{"target": "staging"},
+			wantAction:     ActionAsk,
+			wantAllowed:    false, // Needs user approval
+			wantViolation:  false,
+			wantFailedArg:  "",
+		},
+		{
+			name:           "Invalid args returns BLOCK (not ASK)",
+			args:           map[string]any{"target": "production-eu"},
+			wantAction:     ActionBlock,
+			wantAllowed:    false,
+			wantViolation:  true,
+			wantFailedArg:  "target",
+		},
+		{
+			name:           "Missing required arg returns BLOCK",
+			args:           map[string]any{},
+			wantAction:     ActionBlock,
+			wantAllowed:    false,
+			wantViolation:  true,
+			wantFailedArg:  "target",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			decision := engine.IsAllowed("sensitive_tool", tt.args)
+
+			if decision.Action != tt.wantAction {
+				t.Errorf("Action = %q, want %q", decision.Action, tt.wantAction)
+			}
+			if decision.Allowed != tt.wantAllowed {
+				t.Errorf("Allowed = %v, want %v", decision.Allowed, tt.wantAllowed)
+			}
+			if decision.ViolationDetected != tt.wantViolation {
+				t.Errorf("ViolationDetected = %v, want %v", decision.ViolationDetected, tt.wantViolation)
+			}
+			if tt.wantFailedArg != "" && decision.FailedArg != tt.wantFailedArg {
+				t.Errorf("FailedArg = %q, want %q", decision.FailedArg, tt.wantFailedArg)
+			}
+		})
+	}
+}
+
+// TestInvalidActionReturnsError tests that invalid action values cause Load() to fail.
+func TestInvalidActionReturnsError(t *testing.T) {
+	policyYAML := `
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: invalid-action-test
+spec:
+  tool_rules:
+    - tool: bad_tool
+      action: invalid_action
+`
+
+	engine := NewEngine()
+	err := engine.Load([]byte(policyYAML))
+
+	if err == nil {
+		t.Error("Expected Load() to fail with invalid action, but it succeeded")
+	}
+}
+
+// TestDefaultActionIsAllow tests that omitting action defaults to "allow".
+func TestDefaultActionIsAllow(t *testing.T) {
+	policyYAML := `
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: default-action-test
+spec:
+  tool_rules:
+    - tool: some_tool
+      # action not specified - should default to allow
+      allow_args:
+        param: "^valid$"
+`
+
+	engine := NewEngine()
+	if err := engine.Load([]byte(policyYAML)); err != nil {
+		t.Fatalf("Failed to load policy: %v", err)
+	}
+
+	// Valid args should be allowed directly (not ASK)
+	decision := engine.IsAllowed("some_tool", map[string]any{"param": "valid"})
+	if decision.Action != ActionAllow {
+		t.Errorf("Default action = %q, want %q", decision.Action, ActionAllow)
+	}
+	if !decision.Allowed {
+		t.Error("Tool with valid args should be allowed")
+	}
+}
+
+// TestMixedActionsInPolicy tests a policy with multiple tools using different actions.
+func TestMixedActionsInPolicy(t *testing.T) {
+	policyYAML := `
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: mixed-actions-test
+spec:
+  allowed_tools:
+    - safe_tool
+  tool_rules:
+    - tool: ask_tool
+      action: ask
+    - tool: block_tool
+      action: block
+    - tool: allow_tool
+      action: allow
+`
+
+	engine := NewEngine()
+	if err := engine.Load([]byte(policyYAML)); err != nil {
+		t.Fatalf("Failed to load policy: %v", err)
+	}
+
+	tests := []struct {
+		tool       string
+		wantAction string
+	}{
+		{"safe_tool", ActionAllow},
+		{"ask_tool", ActionAsk},
+		{"block_tool", ActionBlock},
+		{"allow_tool", ActionAllow},
+		{"unknown_tool", ActionBlock}, // Not in allowed_tools
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.tool, func(t *testing.T) {
+			decision := engine.IsAllowed(tt.tool, nil)
+			if decision.Action != tt.wantAction {
+				t.Errorf("Action for %q = %q, want %q", tt.tool, decision.Action, tt.wantAction)
+			}
+		})
+	}
+}
+
+// TestDecisionIncludesAction tests that all decisions include the Action field.
+func TestDecisionIncludesAction(t *testing.T) {
+	policyYAML := `
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: action-field-test
+spec:
+  allowed_tools:
+    - allowed_tool
+`
+
+	engine := NewEngine()
+	if err := engine.Load([]byte(policyYAML)); err != nil {
+		t.Fatalf("Failed to load policy: %v", err)
+	}
+
+	// Allowed tool
+	decision := engine.IsAllowed("allowed_tool", nil)
+	if decision.Action == "" {
+		t.Error("Decision.Action should not be empty for allowed tool")
+	}
+	if decision.Action != ActionAllow {
+		t.Errorf("Action = %q, want %q", decision.Action, ActionAllow)
+	}
+
+	// Blocked tool
+	decision = engine.IsAllowed("blocked_tool", nil)
+	if decision.Action == "" {
+		t.Error("Decision.Action should not be empty for blocked tool")
+	}
+	if decision.Action != ActionBlock {
+		t.Errorf("Action = %q, want %q", decision.Action, ActionBlock)
+	}
+}

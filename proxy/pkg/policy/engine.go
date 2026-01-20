@@ -111,9 +111,18 @@ type PolicySpec struct {
 //	  - tool: run_query
 //	    allow_args:
 //	      query: "^SELECT\\s+.*"
+//	  - tool: dangerous_tool
+//	    action: ask
 type ToolRule struct {
 	// Tool is the name of the tool this rule applies to.
 	Tool string `yaml:"tool"`
+
+	// Action specifies what happens when this tool is called.
+	// Values: "allow" (default), "block", "ask"
+	// - "allow": Permit the tool call (subject to arg validation)
+	// - "block": Deny the tool call unconditionally
+	// - "ask": Prompt user via native OS dialog for approval
+	Action string `yaml:"action,omitempty"`
 
 	// AllowArgs maps argument names to regex patterns.
 	// Each argument value must match its corresponding regex.
@@ -135,6 +144,16 @@ const (
 	ModeEnforce = "enforce"
 	// ModeMonitor logs violations but allows requests through (dry run).
 	ModeMonitor = "monitor"
+)
+
+// ActionType constants for rule actions.
+const (
+	// ActionAllow permits the tool call (default).
+	ActionAllow = "allow"
+	// ActionBlock denies the tool call.
+	ActionBlock = "block"
+	// ActionAsk prompts the user for approval via native OS dialog.
+	ActionAsk = "ask"
 )
 
 // Engine evaluates tool calls against the loaded policy.
@@ -209,6 +228,15 @@ func (e *Engine) Load(data []byte) error {
 		rule := &policy.Spec.ToolRules[i]
 		normalized := strings.ToLower(strings.TrimSpace(rule.Tool))
 
+		// Normalize and validate action field
+		rule.Action = strings.ToLower(strings.TrimSpace(rule.Action))
+		if rule.Action == "" {
+			rule.Action = ActionAllow // Default to allow
+		}
+		if rule.Action != ActionAllow && rule.Action != ActionBlock && rule.Action != ActionAsk {
+			return fmt.Errorf("invalid action %q for tool %q, must be 'allow', 'block', or 'ask'", rule.Action, rule.Tool)
+		}
+
 		// Compile all regex patterns for this tool
 		rule.compiledArgs = make(map[string]*regexp.Regexp, len(rule.AllowArgs))
 		for argName, pattern := range rule.AllowArgs {
@@ -222,6 +250,7 @@ func (e *Engine) Load(data []byte) error {
 		e.toolRules[normalized] = rule
 
 		// Implicitly add tool to allowed set if it has rules defined
+		// (even if action=block or action=ask, we track the tool for rule lookup)
 		e.allowedSet[normalized] = struct{}{}
 	}
 
@@ -256,11 +285,22 @@ func (e *Engine) LoadFromFile(path string) error {
 //
 // The ViolationDetected field is critical for audit logging to identify
 // "dry run blocks" in monitor mode.
+//
+// The Action field supports human-in-the-loop approval:
+//   - ActionAllow: Forward request to server
+//   - ActionBlock: Return error to client
+//   - ActionAsk: Prompt user for approval via native OS dialog
 type Decision struct {
 	// Allowed indicates if the request should be forwarded to the server.
 	// In enforce mode: false = blocked
 	// In monitor mode: always true (violations pass through)
+	// Note: When Action=ActionAsk, Allowed is not the final answer.
 	Allowed bool
+
+	// Action specifies the required action for this tool call.
+	// Values: "allow", "block", "ask"
+	// When Action="ask", the proxy should prompt the user for approval.
+	Action string
 
 	// ViolationDetected indicates if a policy violation was found.
 	// true = policy would block this request (or did block in enforce mode)
@@ -286,13 +326,17 @@ type ValidationResult = Decision
 // This is the primary authorization check called by the proxy for every
 // tools/call request. The check flow is:
 //
-//  1. Check if tool is in allowed_tools list (O(1) lookup)
-//  2. If tool has argument rules in tool_rules, validate each argument
-//  3. Return detailed Decision for error reporting and audit logging
+//  1. Check if tool has a rule with action="block" → Return BLOCK decision
+//  2. Check if tool has a rule with action="ask" → Return ASK decision
+//  3. Check if tool is in allowed_tools list (O(1) lookup)
+//  4. If tool has argument rules in tool_rules, validate each argument
+//  5. Return detailed Decision for error reporting and audit logging
 //
 // Tool names are normalized to lowercase for case-insensitive matching.
 //
 // Authorization Logic:
+//   - Tool has action="block" → Block unconditionally
+//   - Tool has action="ask" → Return ASK (requires user approval)
 //   - Tool not in allowed_tools → Violation detected
 //   - Tool allowed, no argument rules → Allow (implicit allow all args)
 //   - Tool allowed, has argument rules → Validate each constrained arg
@@ -302,11 +346,14 @@ type ValidationResult = Decision
 //   - When mode="monitor", violations set ViolationDetected=true but Allowed=true
 //   - This enables "dry run" testing of policies before enforcement
 //   - The proxy should log these as "ALLOW_MONITOR" decisions
+//   - Note: action="ask" rules still require user approval in monitor mode
 //
 // Example:
 //
 //	decision := engine.IsAllowed("fetch_url", map[string]any{"url": "https://evil.com"})
-//	if decision.ViolationDetected {
+//	if decision.Action == ActionAsk {
+//	    // Prompt user for approval via native OS dialog
+//	} else if decision.ViolationDetected {
 //	    if !decision.Allowed {
 //	        // ENFORCE mode: Return JSON-RPC Forbidden error
 //	    } else {
@@ -318,6 +365,7 @@ func (e *Engine) IsAllowed(toolName string, args map[string]any) Decision {
 		// No policy loaded = deny all (fail closed)
 		return Decision{
 			Allowed:           false,
+			Action:            ActionBlock,
 			ViolationDetected: true,
 			Reason:            "no policy loaded",
 		}
@@ -326,23 +374,62 @@ func (e *Engine) IsAllowed(toolName string, args map[string]any) Decision {
 	// Normalize tool name for case-insensitive comparison
 	normalized := strings.ToLower(strings.TrimSpace(toolName))
 
-	// Step 1: Check if tool is in allowed list
+	// Step 1: Check if tool has a specific rule with action
+	rule, hasRule := e.toolRules[normalized]
+	if hasRule {
+		// Check action type first
+		switch rule.Action {
+		case ActionBlock:
+			// Unconditionally block this tool
+			return Decision{
+				Allowed:           false,
+				Action:            ActionBlock,
+				ViolationDetected: true,
+				Reason:            "tool has action=block in tool_rules",
+			}
+		case ActionAsk:
+			// Requires user approval - validate args first if present
+			if len(rule.compiledArgs) > 0 {
+				// Validate arguments before asking user
+				for argName, compiledRegex := range rule.compiledArgs {
+					argValue, exists := args[argName]
+					if !exists {
+						return e.makeDecision(false, "required argument missing", argName, rule.AllowArgs[argName])
+					}
+					strValue := argToString(argValue)
+					if !compiledRegex.MatchString(strValue) {
+						return e.makeDecision(false, "argument failed regex validation", argName, rule.AllowArgs[argName])
+					}
+				}
+			}
+			// Arguments valid (or no arg rules), return ASK decision
+			return Decision{
+				Allowed:           false, // Not automatically allowed
+				Action:            ActionAsk,
+				ViolationDetected: false, // Not a violation, just needs approval
+				Reason:            "tool requires user approval (action=ask)",
+			}
+		}
+		// action="allow" falls through to normal validation
+	}
+
+	// Step 2: Check if tool is in allowed list
 	if _, allowed := e.allowedSet[normalized]; !allowed {
 		return e.makeDecision(false, "tool not in allowed_tools list", "", "")
 	}
 
-	// Step 2: Check for argument-level rules
-	rule, hasRule := e.toolRules[normalized]
+	// Step 3: Check for argument-level rules (for action=allow)
 	if !hasRule || len(rule.compiledArgs) == 0 {
 		// No argument rules = implicit allow all args
 		return Decision{
 			Allowed:           true,
+			Action:            ActionAllow,
 			ViolationDetected: false,
 			Reason:            "tool allowed, no argument constraints",
 		}
 	}
 
-	// Step 3: Validate each constrained argument
+	// Step 4: Validate each constrained argument
 	for argName, compiledRegex := range rule.compiledArgs {
 		argValue, exists := args[argName]
 		if !exists {
@@ -363,6 +450,7 @@ func (e *Engine) IsAllowed(toolName string, args map[string]any) Decision {
 	// All argument validations passed
 	return Decision{
 		Allowed:           true,
+		Action:            ActionAllow,
 		ViolationDetected: false,
 		Reason:            "tool and arguments permitted",
 	}
@@ -370,12 +458,13 @@ func (e *Engine) IsAllowed(toolName string, args map[string]any) Decision {
 
 // makeDecision creates a Decision based on violation and current mode.
 //
-// In enforce mode: violations result in Allowed=false
-// In monitor mode: violations result in Allowed=true, ViolationDetected=true
+// In enforce mode: violations result in Allowed=false, Action=ActionBlock
+// In monitor mode: violations result in Allowed=true, Action=ActionAllow, ViolationDetected=true
 func (e *Engine) makeDecision(wouldAllow bool, reason, failedArg, failedRule string) Decision {
 	if wouldAllow {
 		return Decision{
 			Allowed:           true,
+			Action:            ActionAllow,
 			ViolationDetected: false,
 			Reason:            reason,
 			FailedArg:         failedArg,
@@ -388,6 +477,7 @@ func (e *Engine) makeDecision(wouldAllow bool, reason, failedArg, failedRule str
 		// Monitor mode: allow through but flag as violation
 		return Decision{
 			Allowed:           true,
+			Action:            ActionAllow, // Monitor mode allows through
 			ViolationDetected: true,
 			Reason:            reason + " (monitor mode: allowed for dry run)",
 			FailedArg:         failedArg,
@@ -398,6 +488,7 @@ func (e *Engine) makeDecision(wouldAllow bool, reason, failedArg, failedRule str
 	// Enforce mode: block the request
 	return Decision{
 		Allowed:           false,
+		Action:            ActionBlock,
 		ViolationDetected: true,
 		Reason:            reason,
 		FailedArg:         failedArg,

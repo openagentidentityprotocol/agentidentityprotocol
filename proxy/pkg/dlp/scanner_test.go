@@ -1,6 +1,8 @@
 package dlp
 
 import (
+	"bytes"
+	"strings"
 	"testing"
 
 	"github.com/ArangoGutierrez/agent-identity-protocol/proxy/pkg/policy"
@@ -333,4 +335,744 @@ func TestScanner_TestCase_FromSpec(t *testing.T) {
 // boolPtr is a helper to create *bool values
 func boolPtr(b bool) *bool {
 	return &b
+}
+
+// -----------------------------------------------------------------------------
+// Deep/Recursive Scanning Tests
+// -----------------------------------------------------------------------------
+
+// TestRedactDeep_NestedMaps tests that secrets in nested map structures are found.
+// This is the key security test - prevents the bypass attack via nested args.
+func TestRedactDeep_NestedMaps(t *testing.T) {
+	cfg := &policy.DLPConfig{
+		Patterns: []policy.DLPPattern{
+			{Name: "AWS Key", Regex: `AKIA[A-Z0-9]{16}`},
+			{Name: "Email", Regex: `[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}`},
+		},
+	}
+	scanner, err := NewScanner(cfg)
+	if err != nil {
+		t.Fatalf("failed to create scanner: %v", err)
+	}
+
+	tests := []struct {
+		name       string
+		input      any
+		wantRules  []string
+		checkFunc  func(t *testing.T, result any)
+	}{
+		{
+			name: "single level map with secret",
+			input: map[string]any{
+				"key": "AKIAIOSFODNN7EXAMPLE",
+			},
+			wantRules: []string{"AWS Key"},
+			checkFunc: func(t *testing.T, result any) {
+				m := result.(map[string]any)
+				if m["key"] != "[REDACTED:AWS Key]" {
+					t.Errorf("expected redacted key, got %v", m["key"])
+				}
+			},
+		},
+		{
+			name: "two levels deep - THE BYPASS ATTACK",
+			input: map[string]any{
+				"config": map[string]any{
+					"aws": map[string]any{
+						"access_key": "AKIAIOSFODNN7EXAMPLE",
+					},
+				},
+			},
+			wantRules: []string{"AWS Key"},
+			checkFunc: func(t *testing.T, result any) {
+				m := result.(map[string]any)
+				config := m["config"].(map[string]any)
+				aws := config["aws"].(map[string]any)
+				if aws["access_key"] != "[REDACTED:AWS Key]" {
+					t.Errorf("nested secret not redacted: %v", aws["access_key"])
+				}
+			},
+		},
+		{
+			name: "three levels deep",
+			input: map[string]any{
+				"level1": map[string]any{
+					"level2": map[string]any{
+						"level3": map[string]any{
+							"secret": "AKIAIOSFODNN7EXAMPLE",
+						},
+					},
+				},
+			},
+			wantRules: []string{"AWS Key"},
+			checkFunc: func(t *testing.T, result any) {
+				m := result.(map[string]any)
+				l1 := m["level1"].(map[string]any)
+				l2 := l1["level2"].(map[string]any)
+				l3 := l2["level3"].(map[string]any)
+				if l3["secret"] != "[REDACTED:AWS Key]" {
+					t.Errorf("deep nested secret not redacted: %v", l3["secret"])
+				}
+			},
+		},
+		{
+			name: "multiple secrets at different levels",
+			input: map[string]any{
+				"email": "user@example.com",
+				"nested": map[string]any{
+					"aws_key": "AKIAIOSFODNN7EXAMPLE",
+				},
+			},
+			wantRules: []string{"Email", "AWS Key"},
+			checkFunc: func(t *testing.T, result any) {
+				m := result.(map[string]any)
+				if m["email"] != "[REDACTED:Email]" {
+					t.Errorf("top-level email not redacted")
+				}
+				nested := m["nested"].(map[string]any)
+				if nested["aws_key"] != "[REDACTED:AWS Key]" {
+					t.Errorf("nested aws_key not redacted")
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, events := scanner.RedactDeep(tt.input)
+
+			// Check events
+			if len(events) != len(tt.wantRules) {
+				t.Errorf("expected %d events, got %d: %v", len(tt.wantRules), len(events), events)
+			}
+
+			// Check result
+			if tt.checkFunc != nil {
+				tt.checkFunc(t, result)
+			}
+		})
+	}
+}
+
+// TestRedactDeep_Arrays tests that secrets in arrays are found.
+func TestRedactDeep_Arrays(t *testing.T) {
+	cfg := &policy.DLPConfig{
+		Patterns: []policy.DLPPattern{
+			{Name: "Email", Regex: `[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}`},
+		},
+	}
+	scanner, err := NewScanner(cfg)
+	if err != nil {
+		t.Fatalf("failed to create scanner: %v", err)
+	}
+
+	tests := []struct {
+		name      string
+		input     any
+		wantCount int
+	}{
+		{
+			name: "array of strings with secrets",
+			input: map[string]any{
+				"emails": []any{
+					"user1@example.com",
+					"user2@example.com",
+					"not-an-email",
+				},
+			},
+			wantCount: 2,
+		},
+		{
+			name: "array of objects with secrets",
+			input: map[string]any{
+				"users": []any{
+					map[string]any{"email": "alice@test.org"},
+					map[string]any{"email": "bob@test.org"},
+					map[string]any{"name": "charlie"},
+				},
+			},
+			wantCount: 2,
+		},
+		{
+			name: "nested arrays",
+			input: map[string]any{
+				"data": []any{
+					[]any{
+						"nested@email.com",
+					},
+				},
+			},
+			wantCount: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, events := scanner.RedactDeep(tt.input)
+
+			totalMatches := 0
+			for _, e := range events {
+				totalMatches += e.MatchCount
+			}
+
+			if totalMatches != tt.wantCount {
+				t.Errorf("expected %d matches, got %d: %v", tt.wantCount, totalMatches, events)
+			}
+		})
+	}
+}
+
+// TestRedactDeep_Primitives tests that non-string primitives pass through unchanged.
+func TestRedactDeep_Primitives(t *testing.T) {
+	cfg := &policy.DLPConfig{
+		Patterns: []policy.DLPPattern{
+			{Name: "AWS Key", Regex: `AKIA[A-Z0-9]{16}`},
+		},
+	}
+	scanner, err := NewScanner(cfg)
+	if err != nil {
+		t.Fatalf("failed to create scanner: %v", err)
+	}
+
+	input := map[string]any{
+		"string":  "no sensitive data here",
+		"int":     42,
+		"float":   3.14,
+		"bool":    true,
+		"null":    nil,
+		"int64":   int64(100),
+		"float32": float32(1.5),
+	}
+
+	result, events := scanner.RedactDeep(input)
+
+	// No events expected (no AWS keys in primitives)
+	if len(events) != 0 {
+		t.Errorf("expected no events for clean primitives, got %v", events)
+	}
+
+	// Verify primitives unchanged
+	m := result.(map[string]any)
+	if m["int"] != 42 {
+		t.Errorf("int changed: %v", m["int"])
+	}
+	if m["float"] != 3.14 {
+		t.Errorf("float changed: %v", m["float"])
+	}
+	if m["bool"] != true {
+		t.Errorf("bool changed: %v", m["bool"])
+	}
+	if m["string"] != "no sensitive data here" {
+		t.Errorf("clean string was modified: %v", m["string"])
+	}
+}
+
+// TestRedactDeep_NilScanner tests that nil scanner returns input unchanged.
+func TestRedactDeep_NilScanner(t *testing.T) {
+	var scanner *Scanner
+
+	input := map[string]any{
+		"secret": "AKIAIOSFODNN7EXAMPLE",
+	}
+
+	result, events := scanner.RedactDeep(input)
+
+	// Should return original (check by comparing the secret value)
+	resultMap, ok := result.(map[string]any)
+	if !ok {
+		t.Fatal("nil scanner should return map")
+	}
+	if resultMap["secret"] != "AKIAIOSFODNN7EXAMPLE" {
+		t.Error("nil scanner should return input unchanged")
+	}
+	if events != nil {
+		t.Error("nil scanner should return nil events")
+	}
+}
+
+// TestRedactDeep_OriginalUnchanged verifies that the original input is not modified.
+func TestRedactDeep_OriginalUnchanged(t *testing.T) {
+	cfg := &policy.DLPConfig{
+		Patterns: []policy.DLPPattern{
+			{Name: "AWS Key", Regex: `AKIA[A-Z0-9]{16}`},
+		},
+	}
+	scanner, err := NewScanner(cfg)
+	if err != nil {
+		t.Fatalf("failed to create scanner: %v", err)
+	}
+
+	original := map[string]any{
+		"nested": map[string]any{
+			"key": "AKIAIOSFODNN7EXAMPLE",
+		},
+	}
+
+	// Store original value
+	originalKey := original["nested"].(map[string]any)["key"]
+
+	// Redact
+	result, _ := scanner.RedactDeep(original)
+
+	// Verify original unchanged
+	if original["nested"].(map[string]any)["key"] != originalKey {
+		t.Error("original map was modified!")
+	}
+
+	// Verify result is redacted
+	resultNested := result.(map[string]any)["nested"].(map[string]any)
+	if resultNested["key"] == originalKey {
+		t.Error("result should be redacted")
+	}
+}
+
+// TestRedactMap_Convenience tests the RedactMap convenience method.
+func TestRedactMap_Convenience(t *testing.T) {
+	cfg := &policy.DLPConfig{
+		Patterns: []policy.DLPPattern{
+			{Name: "Email", Regex: `[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}`},
+		},
+	}
+	scanner, err := NewScanner(cfg)
+	if err != nil {
+		t.Fatalf("failed to create scanner: %v", err)
+	}
+
+	input := map[string]any{
+		"contact": map[string]any{
+			"email": "test@example.com",
+		},
+	}
+
+	result, events := scanner.RedactMap(input)
+
+	if len(events) != 1 {
+		t.Errorf("expected 1 event, got %d", len(events))
+	}
+
+	contact := result["contact"].(map[string]any)
+	if contact["email"] != "[REDACTED:Email]" {
+		t.Errorf("email not redacted: %v", contact["email"])
+	}
+}
+
+// TestRedactDeep_SecurityBypassPrevention is the key security test.
+// It simulates the exact attack vector from the security review.
+func TestRedactDeep_SecurityBypassPrevention(t *testing.T) {
+	// This is the exact attack scenario:
+	// Attacker hides AWS key in nested structure to bypass shallow DLP
+	cfg := &policy.DLPConfig{
+		Patterns: []policy.DLPPattern{
+			{Name: "AWS Key", Regex: `(A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}`},
+		},
+	}
+	scanner, err := NewScanner(cfg)
+	if err != nil {
+		t.Fatalf("failed to create scanner: %v", err)
+	}
+
+	// Attack payload - secret hidden in nested structure
+	attackPayload := map[string]any{
+		"url": "https://allowed-domain.com/api",
+		"body": map[string]any{
+			"data": []any{
+				map[string]any{
+					"secret": "AKIAIOSFODNN7EXAMPLE",
+				},
+			},
+		},
+	}
+
+	result, events := scanner.RedactDeep(attackPayload)
+
+	// CRITICAL: The secret MUST be detected
+	if len(events) == 0 {
+		t.Fatal("SECURITY FAILURE: Nested secret was not detected!")
+	}
+
+	// Verify the secret is redacted in the result
+	body := result.(map[string]any)["body"].(map[string]any)
+	data := body["data"].([]any)
+	item := data[0].(map[string]any)
+
+	if item["secret"] == "AKIAIOSFODNN7EXAMPLE" {
+		t.Fatal("SECURITY FAILURE: Secret was not redacted in output!")
+	}
+
+	if item["secret"] != "[REDACTED:AWS Key]" {
+		t.Errorf("unexpected redaction format: %v", item["secret"])
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Encoding Detection Tests
+// -----------------------------------------------------------------------------
+
+// TestEncodingDetection_Base64 tests detection of base64 encoded secrets.
+func TestEncodingDetection_Base64(t *testing.T) {
+	// AWS Key: AKIAIOSFODNN7EXAMPLE
+	// Base64:  QUtJQUlPU0ZPRE5ON0VYQU1QTEU=
+	cfg := &policy.DLPConfig{
+		DetectEncoding: true,
+		Patterns: []policy.DLPPattern{
+			{Name: "AWS Key", Regex: `(A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}`},
+		},
+	}
+	scanner, err := NewScanner(cfg)
+	if err != nil {
+		t.Fatalf("failed to create scanner: %v", err)
+	}
+
+	tests := []struct {
+		name           string
+		input          string
+		wantRedacted   bool
+		wantEventCount int
+	}{
+		{
+			name:           "plain secret detected",
+			input:          "Key: AKIAIOSFODNN7EXAMPLE",
+			wantRedacted:   true,
+			wantEventCount: 1,
+		},
+		{
+			name:           "base64 encoded secret detected",
+			input:          "Encoded: QUtJQUlPU0ZPRE5ON0VYQU1QTEU=",
+			wantRedacted:   true,
+			wantEventCount: 1,
+		},
+		{
+			name:           "no false positive on random base64",
+			input:          "Random: SGVsbG8gV29ybGQh", // "Hello World!"
+			wantRedacted:   false,
+			wantEventCount: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			output, events := scanner.Redact(tt.input)
+
+			if tt.wantRedacted && output == tt.input {
+				t.Error("expected redaction but got unchanged output")
+			}
+			if !tt.wantRedacted && output != tt.input {
+				t.Errorf("unexpected redaction: %s", output)
+			}
+			if len(events) != tt.wantEventCount {
+				t.Errorf("event count = %d, want %d", len(events), tt.wantEventCount)
+			}
+		})
+	}
+}
+
+// TestEncodingDetection_Hex tests detection of hex encoded secrets.
+func TestEncodingDetection_Hex(t *testing.T) {
+	// AWS Key: AKIAIOSFODNN7EXAMPLE
+	// Hex:     414b4941494f53464f444e4e374558414d504c45
+	cfg := &policy.DLPConfig{
+		DetectEncoding: true,
+		Patterns: []policy.DLPPattern{
+			{Name: "AWS Key", Regex: `(A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}`},
+		},
+	}
+	scanner, err := NewScanner(cfg)
+	if err != nil {
+		t.Fatalf("failed to create scanner: %v", err)
+	}
+
+	tests := []struct {
+		name           string
+		input          string
+		wantRedacted   bool
+		wantEventCount int
+	}{
+		{
+			name:           "hex encoded secret detected",
+			input:          "Hex key: 414b4941494f53464f444e4e374558414d504c45",
+			wantRedacted:   true,
+			wantEventCount: 1,
+		},
+		{
+			name:           "hex with 0x prefix detected",
+			input:          "Key: 0x414b4941494f53464f444e4e374558414d504c45",
+			wantRedacted:   true,
+			wantEventCount: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			output, events := scanner.Redact(tt.input)
+
+			if tt.wantRedacted && output == tt.input {
+				t.Error("expected redaction but got unchanged output")
+			}
+			if len(events) != tt.wantEventCount {
+				t.Errorf("event count = %d, want %d", len(events), tt.wantEventCount)
+			}
+		})
+	}
+}
+
+// TestEncodingDetection_Disabled tests that encoding detection is off by default.
+func TestEncodingDetection_Disabled(t *testing.T) {
+	// AWS Key: AKIAIOSFODNN7EXAMPLE  →  Base64: QUtJQUlPU0ZPRE5ON0VYQU1QTEU=
+	cfg := &policy.DLPConfig{
+		DetectEncoding: false, // Explicitly disabled (also default)
+		Patterns: []policy.DLPPattern{
+			{Name: "AWS Key", Regex: `(A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}`},
+		},
+	}
+	scanner, err := NewScanner(cfg)
+	if err != nil {
+		t.Fatalf("failed to create scanner: %v", err)
+	}
+
+	// Encoded secret should NOT be detected when encoding detection is disabled
+	input := "Encoded: QUtJQUlPU0ZPRE5ON0VYQU1QTEU="
+	output, events := scanner.Redact(input)
+
+	if output != input {
+		t.Errorf("encoding detection should be disabled, but got redaction: %s", output)
+	}
+	if len(events) != 0 {
+		t.Errorf("expected no events, got %d", len(events))
+	}
+}
+
+// TestEncodingDetection_SecurityBypass is the key security test.
+// Simulates the exact attack from the security review.
+func TestEncodingDetection_SecurityBypass(t *testing.T) {
+	cfg := &policy.DLPConfig{
+		DetectEncoding: true,
+		Patterns: []policy.DLPPattern{
+			{Name: "AWS Key", Regex: `(A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}`},
+			{Name: "Password", Regex: `(?i)password\s*[:=]\s*\S+`},
+		},
+	}
+	scanner, err := NewScanner(cfg)
+	if err != nil {
+		t.Fatalf("failed to create scanner: %v", err)
+	}
+
+	// Attack scenario: Agent encodes secret to bypass DLP
+	// Original: {"secret": "AKIAIOSFODNN7EXAMPLE"}
+	// Encoded:  {"secret": "QUtJQUlPU0ZPRE5ON0VYQU1QTEU="}
+	attackPayload := `{"secret": "QUtJQUlPU0ZPRE5ON0VYQU1QTEU="}`
+
+	output, events := scanner.Redact(attackPayload)
+
+	// CRITICAL: The encoded secret MUST be detected
+	if len(events) == 0 {
+		t.Fatal("SECURITY FAILURE: Base64-encoded secret was not detected!")
+	}
+
+	// Verify original encoded string is replaced
+	if output == attackPayload {
+		t.Fatal("SECURITY FAILURE: Output unchanged - encoded secret passed through!")
+	}
+
+	// Verify it mentions encoding
+	foundEncoded := false
+	for _, e := range events {
+		if e.RuleName == "AWS Key (encoded)" {
+			foundEncoded = true
+			break
+		}
+	}
+	if !foundEncoded {
+		t.Errorf("expected event with '(encoded)' suffix, got: %v", events)
+	}
+}
+
+// TestEncodingDetection_NoFalsePositives tests that legitimate base64 isn't flagged.
+func TestEncodingDetection_NoFalsePositives(t *testing.T) {
+	cfg := &policy.DLPConfig{
+		DetectEncoding: true,
+		Patterns: []policy.DLPPattern{
+			{Name: "AWS Key", Regex: `(A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}`},
+		},
+	}
+	scanner, err := NewScanner(cfg)
+	if err != nil {
+		t.Fatalf("failed to create scanner: %v", err)
+	}
+
+	// Legitimate base64 content that doesn't contain secrets
+	legitimateInputs := []string{
+		"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk",
+		"Authorization: Basic dXNlcm5hbWU6cGFzc3dvcmQ=", // "username:password"
+		"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",          // JWT header (no secret pattern)
+	}
+
+	for _, input := range legitimateInputs {
+		output, events := scanner.Redact(input)
+		if output != input {
+			t.Errorf("false positive on legitimate content:\n  input:  %s\n  output: %s", input, output)
+		}
+		if len(events) != 0 {
+			t.Errorf("unexpected events for: %s", input)
+		}
+	}
+}
+
+// TestDetectsEncoding tests the DetectsEncoding() method.
+func TestDetectsEncoding(t *testing.T) {
+	// nil scanner
+	var nilScanner *Scanner
+	if nilScanner.DetectsEncoding() {
+		t.Error("nil scanner should return false")
+	}
+
+	// With detection enabled
+	cfg := &policy.DLPConfig{
+		DetectEncoding: true,
+		Patterns:       []policy.DLPPattern{{Name: "Test", Regex: "test"}},
+	}
+	scanner, _ := NewScanner(cfg)
+	if !scanner.DetectsEncoding() {
+		t.Error("scanner with detect_encoding=true should return true")
+	}
+
+	// With detection disabled
+	cfg2 := &policy.DLPConfig{
+		DetectEncoding: false,
+		Patterns:       []policy.DLPPattern{{Name: "Test", Regex: "test"}},
+	}
+	scanner2, _ := NewScanner(cfg2)
+	if scanner2.DetectsEncoding() {
+		t.Error("scanner with detect_encoding=false should return false")
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Filtered Writer Tests
+// -----------------------------------------------------------------------------
+
+// TestFilteredWriter_RedactsOutput tests that the filtered writer redacts secrets.
+func TestFilteredWriter_RedactsOutput(t *testing.T) {
+	cfg := &policy.DLPConfig{
+		Patterns: []policy.DLPPattern{
+			{Name: "AWS Key", Regex: `(A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}`},
+		},
+	}
+	scanner, err := NewScanner(cfg)
+	if err != nil {
+		t.Fatalf("failed to create scanner: %v", err)
+	}
+
+	var buf bytes.Buffer
+	filtered := NewFilteredWriter(&buf, scanner, nil, "")
+
+	// Write output containing a secret
+	input := "Error: failed to connect with key AKIAIOSFODNN7EXAMPLE\n"
+	n, err := filtered.Write([]byte(input))
+
+	if err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+	if n != len(input) {
+		t.Errorf("Write returned %d, want %d", n, len(input))
+	}
+
+	// Verify secret was redacted
+	output := buf.String()
+	if strings.Contains(output, "AKIAIOSFODNN7EXAMPLE") {
+		t.Error("secret was not redacted in output")
+	}
+	if !strings.Contains(output, "[REDACTED:AWS Key]") {
+		t.Errorf("expected redaction placeholder, got: %s", output)
+	}
+}
+
+// TestFilteredWriter_NilScanner tests passthrough when scanner is nil.
+func TestFilteredWriter_NilScanner(t *testing.T) {
+	var buf bytes.Buffer
+	filtered := NewFilteredWriter(&buf, nil, nil, "")
+
+	input := "Error: key is AKIAIOSFODNN7EXAMPLE\n"
+	_, err := filtered.Write([]byte(input))
+	if err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+
+	// With nil scanner, output should be unchanged
+	if buf.String() != input {
+		t.Errorf("expected passthrough, got: %s", buf.String())
+	}
+}
+
+// TestFilteredWriter_MultipleWrites tests that each write is independently scanned.
+func TestFilteredWriter_MultipleWrites(t *testing.T) {
+	cfg := &policy.DLPConfig{
+		Patterns: []policy.DLPPattern{
+			{Name: "Secret", Regex: `secret_[a-z]+`},
+		},
+	}
+	scanner, _ := NewScanner(cfg)
+
+	var buf bytes.Buffer
+	filtered := NewFilteredWriter(&buf, scanner, nil, "")
+
+	// Multiple writes
+	filtered.Write([]byte("Line 1: secret_alpha\n"))
+	filtered.Write([]byte("Line 2: no secrets here\n"))
+	filtered.Write([]byte("Line 3: secret_beta\n"))
+
+	output := buf.String()
+
+	// Both secrets should be redacted
+	if strings.Contains(output, "secret_alpha") || strings.Contains(output, "secret_beta") {
+		t.Error("secrets not redacted in multi-write output")
+	}
+	if !strings.Contains(output, "no secrets here") {
+		t.Error("non-secret content was incorrectly modified")
+	}
+}
+
+// TestFilteredWriter_StderrSecurityBypass is the key security test.
+// Simulates the attack from the security review.
+func TestFilteredWriter_StderrSecurityBypass(t *testing.T) {
+	cfg := &policy.DLPConfig{
+		Patterns: []policy.DLPPattern{
+			{Name: "AWS Key", Regex: `(A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}`},
+			{Name: "Password", Regex: `(?i)password\s*[:=]\s*\S+`},
+		},
+	}
+	scanner, _ := NewScanner(cfg)
+
+	var buf bytes.Buffer
+	filtered := NewFilteredWriter(&buf, scanner, nil, "[subprocess]")
+
+	// Simulate subprocess error output containing secrets
+	stderrOutput := `
+2024-01-15 10:23:45 ERROR Database connection failed
+  host: db.example.com
+  user: admin
+  password: SuperSecret123!
+  
+Stack trace:
+  at AWSClient.connect(key=AKIAIOSFODNN7EXAMPLE)
+  at main.py:42
+`
+	filtered.Write([]byte(stderrOutput))
+
+	output := buf.String()
+
+	// CRITICAL: Secrets MUST be redacted
+	if strings.Contains(output, "SuperSecret123!") {
+		t.Fatal("SECURITY FAILURE: Password leaked through stderr!")
+	}
+	if strings.Contains(output, "AKIAIOSFODNN7EXAMPLE") {
+		t.Fatal("SECURITY FAILURE: AWS key leaked through stderr!")
+	}
+
+	// Non-sensitive data should be preserved
+	if !strings.Contains(output, "Database connection failed") {
+		t.Error("Non-sensitive error message was incorrectly removed")
+	}
+	if !strings.Contains(output, "db.example.com") {
+		t.Error("Non-sensitive hostname was incorrectly removed")
+	}
 }

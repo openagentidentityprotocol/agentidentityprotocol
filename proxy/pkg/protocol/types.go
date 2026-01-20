@@ -8,7 +8,10 @@
 // MCP Specification: https://modelcontextprotocol.io/specification
 package protocol
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strings"
+)
 
 // -----------------------------------------------------------------------------
 // JSON-RPC 2.0 Core Types
@@ -254,8 +257,9 @@ func NewRateLimitedError(requestID json.RawMessage, toolName string) *Response {
 }
 
 // IsToolCall checks if a request is a tool invocation that needs policy checking.
+// Uses case-insensitive comparison to prevent bypass via "Tools/Call" or "TOOLS/CALL".
 func (r *Request) IsToolCall() bool {
-	return r.Method == "tools/call"
+	return strings.EqualFold(r.Method, "tools/call")
 }
 
 // GetToolName extracts the tool name from a tools/call request.

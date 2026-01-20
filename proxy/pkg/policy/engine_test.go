@@ -146,9 +146,9 @@ spec:
 
 	// Tool is allowed, no arg rules = allow any args
 	result := engine.IsAllowed("unrestricted_tool", map[string]any{
-		"any_arg":    "any_value",
-		"another":    12345,
-		"dangerous":  "../../etc/passwd",
+		"any_arg":   "any_value",
+		"another":   12345,
+		"dangerous": "../../etc/passwd",
 	})
 
 	if !result.Allowed {
@@ -331,28 +331,28 @@ spec:
 	}
 
 	tests := []struct {
-		name              string
-		tool              string
-		wantAllowed       bool
-		wantViolation     bool
+		name          string
+		tool          string
+		wantAllowed   bool
+		wantViolation bool
 	}{
 		{
-			name:              "Allowed tool - no violation",
-			tool:              "safe_tool",
-			wantAllowed:       true,
-			wantViolation:     false,
+			name:          "Allowed tool - no violation",
+			tool:          "safe_tool",
+			wantAllowed:   true,
+			wantViolation: false,
 		},
 		{
-			name:              "Blocked tool - allowed in monitor mode with violation flag",
-			tool:              "dangerous_tool",
-			wantAllowed:       true,  // MONITOR: allowed through
-			wantViolation:     true,  // but flagged as violation
+			name:          "Blocked tool - allowed in monitor mode with violation flag",
+			tool:          "dangerous_tool",
+			wantAllowed:   true, // MONITOR: allowed through
+			wantViolation: true, // but flagged as violation
 		},
 		{
-			name:              "Another blocked tool - same behavior",
-			tool:              "rm_rf_slash",
-			wantAllowed:       true,
-			wantViolation:     true,
+			name:          "Another blocked tool - same behavior",
+			tool:          "rm_rf_slash",
+			wantAllowed:   true,
+			wantViolation: true,
 		},
 	}
 
@@ -398,22 +398,22 @@ spec:
 	}
 
 	tests := []struct {
-		name              string
-		tool              string
-		wantAllowed       bool
-		wantViolation     bool
+		name          string
+		tool          string
+		wantAllowed   bool
+		wantViolation bool
 	}{
 		{
-			name:              "Allowed tool - no violation",
-			tool:              "safe_tool",
-			wantAllowed:       true,
-			wantViolation:     false,
+			name:          "Allowed tool - no violation",
+			tool:          "safe_tool",
+			wantAllowed:   true,
+			wantViolation: false,
 		},
 		{
-			name:              "Blocked tool - denied with violation flag",
-			tool:              "dangerous_tool",
-			wantAllowed:       false, // ENFORCE: blocked
-			wantViolation:     true,
+			name:          "Blocked tool - denied with violation flag",
+			tool:          "dangerous_tool",
+			wantAllowed:   false, // ENFORCE: blocked
+			wantViolation: true,
 		},
 	}
 
@@ -506,32 +506,32 @@ spec:
 	}
 
 	tests := []struct {
-		name              string
-		args              map[string]any
-		wantAllowed       bool
-		wantViolation     bool
-		wantFailedArg     string
+		name          string
+		args          map[string]any
+		wantAllowed   bool
+		wantViolation bool
+		wantFailedArg string
 	}{
 		{
-			name:              "Valid GitHub URL - no violation",
-			args:              map[string]any{"url": "https://github.com/my-repo"},
-			wantAllowed:       true,
-			wantViolation:     false,
-			wantFailedArg:     "",
+			name:          "Valid GitHub URL - no violation",
+			args:          map[string]any{"url": "https://github.com/my-repo"},
+			wantAllowed:   true,
+			wantViolation: false,
+			wantFailedArg: "",
 		},
 		{
-			name:              "Attacker URL - allowed in monitor but flagged",
-			args:              map[string]any{"url": "https://evil.com/steal"},
-			wantAllowed:       true,  // MONITOR: allowed through
-			wantViolation:     true,  // flagged as violation
-			wantFailedArg:     "url",
+			name:          "Attacker URL - allowed in monitor but flagged",
+			args:          map[string]any{"url": "https://evil.com/steal"},
+			wantAllowed:   true, // MONITOR: allowed through
+			wantViolation: true, // flagged as violation
+			wantFailedArg: "url",
 		},
 		{
-			name:              "Missing URL - allowed in monitor but flagged",
-			args:              map[string]any{},
-			wantAllowed:       true,
-			wantViolation:     true,
-			wantFailedArg:     "url",
+			name:          "Missing URL - allowed in monitor but flagged",
+			args:          map[string]any{},
+			wantAllowed:   true,
+			wantViolation: true,
+			wantFailedArg: "url",
 		},
 	}
 
@@ -673,36 +673,36 @@ spec:
 	}
 
 	tests := []struct {
-		name           string
-		args           map[string]any
-		wantAction     string
-		wantAllowed    bool
-		wantViolation  bool
-		wantFailedArg  string
+		name          string
+		args          map[string]any
+		wantAction    string
+		wantAllowed   bool
+		wantViolation bool
+		wantFailedArg string
 	}{
 		{
-			name:           "Valid args returns ASK",
-			args:           map[string]any{"target": "staging"},
-			wantAction:     ActionAsk,
-			wantAllowed:    false, // Needs user approval
-			wantViolation:  false,
-			wantFailedArg:  "",
+			name:          "Valid args returns ASK",
+			args:          map[string]any{"target": "staging"},
+			wantAction:    ActionAsk,
+			wantAllowed:   false, // Needs user approval
+			wantViolation: false,
+			wantFailedArg: "",
 		},
 		{
-			name:           "Invalid args returns BLOCK (not ASK)",
-			args:           map[string]any{"target": "production-eu"},
-			wantAction:     ActionBlock,
-			wantAllowed:    false,
-			wantViolation:  true,
-			wantFailedArg:  "target",
+			name:          "Invalid args returns BLOCK (not ASK)",
+			args:          map[string]any{"target": "production-eu"},
+			wantAction:    ActionBlock,
+			wantAllowed:   false,
+			wantViolation: true,
+			wantFailedArg: "target",
 		},
 		{
-			name:           "Missing required arg returns BLOCK",
-			args:           map[string]any{},
-			wantAction:     ActionBlock,
-			wantAllowed:    false,
-			wantViolation:  true,
-			wantFailedArg:  "target",
+			name:          "Missing required arg returns BLOCK",
+			args:          map[string]any{},
+			wantAction:    ActionBlock,
+			wantAllowed:   false,
+			wantViolation: true,
+			wantFailedArg: "target",
 		},
 	}
 

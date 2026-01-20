@@ -239,3 +239,4 @@ docker-compose.override.yml
 *.kubeconfig
 kubeconfig
 charts/*.tgz
+bin/

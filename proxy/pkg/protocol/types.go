@@ -129,6 +129,14 @@ const (
 
 	// ErrCodeSessionExpired indicates the agent's session has expired.
 	ErrCodeSessionExpired = -32003
+
+	// ErrCodeUserDenied indicates the user explicitly denied the request.
+	// Returned when a tool call with action="ask" was rejected by the user.
+	ErrCodeUserDenied = -32004
+
+	// ErrCodeUserTimeout indicates the user did not respond in time.
+	// Returned when a tool call with action="ask" timed out waiting for user input.
+	ErrCodeUserTimeout = -32005
 )
 
 // -----------------------------------------------------------------------------
@@ -184,6 +192,44 @@ func NewParseError(requestID json.RawMessage, detail string) *Response {
 			Code:    -32700,
 			Message: "Parse error",
 			Data:    detail,
+		},
+	}
+}
+
+// NewUserDeniedError creates a JSON-RPC error response when user denies a tool call.
+//
+// This is used when a tool with action="ask" is rejected by the user
+// via the native OS dialog prompt.
+func NewUserDeniedError(requestID json.RawMessage, toolName string) *Response {
+	return &Response{
+		JSONRPC: "2.0",
+		ID:      requestID,
+		Error: &Error{
+			Code:    ErrCodeUserDenied,
+			Message: "User denied",
+			Data: map[string]string{
+				"tool":   toolName,
+				"reason": "User explicitly denied the tool call via approval dialog",
+			},
+		},
+	}
+}
+
+// NewUserTimeoutError creates a JSON-RPC error response when user approval times out.
+//
+// This is used when a tool with action="ask" does not receive user input
+// within the configured timeout period (default: 60 seconds).
+func NewUserTimeoutError(requestID json.RawMessage, toolName string) *Response {
+	return &Response{
+		JSONRPC: "2.0",
+		ID:      requestID,
+		Error: &Error{
+			Code:    ErrCodeUserTimeout,
+			Message: "User approval timeout",
+			Data: map[string]string{
+				"tool":   toolName,
+				"reason": "User did not respond to approval dialog within timeout",
+			},
 		},
 	}
 }

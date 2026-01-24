@@ -502,11 +502,11 @@ var DefaultAllowedMethods = []string{
 // The engine is not usable until Load() or LoadFromFile() is called.
 func NewEngine() *Engine {
 	return &Engine{
-		allowedSet:     make(map[string]struct{}),
-		toolRules:      make(map[string]*ToolRule),
-		allowedMethods: make(map[string]struct{}),
-		deniedMethods:  make(map[string]struct{}),
-		limiters:       make(map[string]*rate.Limiter),
+		allowedSet: make(map[string]struct{}),
+		toolRules:  make(map[string]*ToolRule),
+		// allowedMethods and deniedMethods are nil by default to trigger
+		// "no policy loaded" behavior in IsMethodAllowed
+		limiters: make(map[string]*rate.Limiter),
 	}
 }
 

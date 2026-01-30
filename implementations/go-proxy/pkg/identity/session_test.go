@@ -128,7 +128,7 @@ func TestSessionShouldRotate(t *testing.T) {
 	}
 
 	// Issue token
-	session.IssueToken()
+	_, _ = session.IssueToken()
 
 	// Fresh token = should not rotate
 	if session.ShouldRotate() {
@@ -154,7 +154,7 @@ func TestSessionStats(t *testing.T) {
 		t.Error("Should not have token before issuing")
 	}
 
-	session.IssueToken()
+	_, _ = session.IssueToken()
 	stats = session.GetStats()
 	if !stats.HasToken {
 		t.Error("Should have token after issuing")

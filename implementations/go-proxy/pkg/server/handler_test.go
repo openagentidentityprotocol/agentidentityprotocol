@@ -116,7 +116,7 @@ func TestHandleValidate_UnknownTool(t *testing.T) {
 	}
 
 	var resp ValidationResponse
-	json.Unmarshal(rec.Body.Bytes(), &resp)
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
 
 	if resp.Decision != "block" {
 		t.Errorf("Expected decision 'block' for unknown tool, got %q", resp.Decision)

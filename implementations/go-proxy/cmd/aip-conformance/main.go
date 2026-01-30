@@ -79,7 +79,7 @@ func main() {
 
 	for _, dir := range dirs {
 		fullPath := filepath.Join(*specDir, dir)
-		
+
 		// Check if directory exists
 		if _, err := os.Stat(fullPath); os.IsNotExist(err) {
 			if *verbose {
@@ -102,7 +102,7 @@ func main() {
 			}
 
 			suiteResults := runTestSuite(filepath.Join(fullPath, file.Name()), *verbose)
-			
+
 			fmt.Printf("\n%s\n", file.Name())
 			for _, res := range suiteResults {
 				totalTests++
@@ -169,7 +169,7 @@ func runTestCase(test TestCase, verbose bool) TestResult {
 
 	// Handle Policy tests
 	engine := policy.NewEngine()
-	
+
 	// Load policy if present
 	if test.Policy != "" {
 		if err := engine.Load([]byte(test.Policy)); err != nil {
@@ -206,7 +206,7 @@ func runTestCase(test TestCase, verbose bool) TestResult {
 	} else if strings.ToLower(test.Input.Method) == "tools/call" {
 		// Tool level check
 		d := engine.IsAllowed(test.Input.Tool, test.Input.Args)
-		
+
 		decision, errorCode, violation = mapDecision(d)
 	} else {
 		// Allowed non-tool method
@@ -276,9 +276,7 @@ func runTestCase(test TestCase, verbose bool) TestResult {
 func mapDecision(d policy.Decision) (string, *int, bool) {
 	var decision string
 	var errorCode *int
-	var violation bool
-
-	violation = d.ViolationDetected
+	violation := d.ViolationDetected
 
 	switch d.Action {
 	case policy.ActionAllow:
@@ -302,7 +300,7 @@ func mapDecision(d policy.Decision) (string, *int, bool) {
 	default:
 		decision = "UNKNOWN"
 	}
-	
+
 	return decision, errorCode, violation
 }
 

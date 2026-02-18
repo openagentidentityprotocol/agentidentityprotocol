@@ -13,26 +13,99 @@
 </p>
 
 ---
+## What is AIP?
+
+AIP (Agent Identity Protocol) is an open-source standard for **authentication, attestation, authorization, and governance of AI agents**. It's the IAM standard for AI. 
+
+Today, agents are granted full permissions to API keys, secrets, and system resources, running *as* the user with no distinction between human and non-human actions. As the line between what a human and an autonomous agent does becomes increasingly blurred, this creates serious risks — not just at a security level, but at a **legal, societal, and economic level**.
+
+AIP is being built and proposed to the [IETF](https://www.ietf.org) to provide a universal standard for identity in the **Internet of Agents (IoA)** — so that anyone, anywhere, can build secure agents and gain full visibility with confidence.
+
 
 ## The God Mode Problem
 
-Today's AI agents operate with **unrestricted access** to your infrastructure. When you connect Claude, Cursor, or any MCP-compatible agent to your systems, it receives *god mode*—full access to every tool the server exposes.
 
-**Model safety isn't enough.** Attacks like **Indirect Prompt Injection**—demonstrated by the [GeminiJack vulnerability](https://embrace-the-red.com/blog/gemini-jack/)—have proven that adversarial instructions embedded in documents, emails, or data can hijack agent behavior. The model *believes* it's following your intent while executing the attacker's commands.
+### Agents Have No Identity Layer
+
+There is no universal way to distinguish an AI agent from a human actor. When you connect Claude, Cursor, or any MCP-compatible agent to your systems, it receives **god mode** — full access to every tool the server exposes, with the same credentials as the user.
+
+**Model safety isn't enough.** Attacks like Indirect Prompt Injection — demonstrated by the [GeminiJack vulnerability](https://embrace-the-red.com/blog/gemini-jack/) — have proven that adversarial instructions embedded in documents, emails, or data can hijack agent behavior. The model *believes* it's following your intent while executing an attacker's commands.
 
 Your agent is one poisoned PDF away from `rm -rf /`.
 
-> ***"Authentication is for Users. AIP is for Agents."***
+Beyond security, agents operating without identity creates systemic gaps:
 
-AIP introduces **policy-based authorization** at the tool-call layer—the missing security primitive between your agents and your infrastructure.
+- **No audit trail** — actions taken by agents are indistinguishable from human actions in logs
+- **No revocation** — once an agent has credentials, there is no standard way to revoke them
+- **No authorization granularity** — access is all-or-nothing at the API key level
+- **Compliance blind spots** — SOC 2, GDPR, HIPAA, and SOX requirements are unmet for agentic actions
+
+> ***"Authentication is for Users. AIP is for Agents."***
+---
+
+## How AIP Works
+
+AIP is built on two layers that work together. **Layer 1 establishes who the agent is.** **Layer 2 decides what it's allowed to do.** The Agent Authentication Token (AAT) is the bridge. It's issued by Layer 1, enforced by Layer 2.
+
+The current Go implementation of AIP introduces **policy-based authorization** at the tool-call layer—the missing security primitive between your agents and your infrastructure. Try it for yourself.
 
 ---
 
-## Architecture
+## Architecture Design
 
-### High-Level Flow
+```
+         LAYER 1 — IDENTITY                    LAYER 2 — ENFORCEMENT
+         (Who is this agent?)                  (What can it do?)
 
-AIP operates as a transparent proxy between the AI client (Cursor, Claude, VS Code) and the MCP tool server. Every tool call passes through the policy engine before reaching the real tool.
+┌─────────────────┐                       ┌─────────────────┐
+│  Root Registry  │  (AIP Authority)      │   AI Client     │
+│  Signs Agent    │                       │ Cursor / Claude │
+│  Certificates   │                       └────────┬────────┘
+└────────┬────────┘                                │ tool call + AAT
+         │ Issues Attestation                      ▼
+         ▼                                ┌─────────────────────────┐
+┌─────────────────┐                       │       AIP Proxy         │
+│ Agent Identity  │                       │                         │
+│  (Public Key)   │                       │ 1. Verify AAT signature │◀── AIP Registry
+└────────┬────────┘                       │ 2. Check token claims   │    (revocation)
+         │ Signs Token Requests           │ 3. Evaluate policy      │
+         ▼                                │ 4. DLP scan             │
+┌─────────────────┐                       │ 5. Audit log            │
+│  Token Issuer   │                       └────────┬────────────────┘
+│  Validates ID   │      AAT                       │ ✅ ALLOW / 🔴 DENY
+│  Issues AAT     │ ─────────────────────────────▶ │
+└─────────────────┘                                ▼
+                                          ┌─────────────────┐
+                                          │   Real Tool     │
+                                          │ Docker/Postgres │
+                                          │ GitHub / etc.   │
+                                          └─────────────────┘
+```
+
+**The AAT is what connects the two layers.** It carries signed claims about the agent — who issued its identity, which user it's acting on behalf of, what capabilities it declared, and when it was issued. The proxy in Layer 2 doesn't just check a static YAML allowlist — it verifies the cryptographic signature on the AAT, checks those claims against policy, and only then permits the tool call.
+
+This means:
+- A **hijacked agent** fails at Layer 2 — its AAT claims don't match the attempted action
+- A **revoked agent** fails at Layer 2 — the proxy checks the registry revocation list on every call
+- A **legitimate agent** passes through both layers with a full audit trail tied to its identity
+
+## Current Architecture Implementation 
+
+### Layer 1 — Agent Identity (Protocol) (IN PROGRESS)
+
+AIP establishes cryptographic identities for AI agents. Before an agent can act, it obtains an AAT from the Token Issuer — a signed token tied to both the agent's key pair and the end-user's identity.
+
+**Security model:**
+- **Root of Trust** — AIP registry holds the issuer private key and signs agent certificates
+- **Agent Key Pair** — each agent generates its own keys; the private key never leaves the agent
+- **AAT Claims** — token encodes agent ID, user binding, capabilities, expiry, and issuer
+- **Revocation** — registry maintains a revocation list checked by the proxy at runtime
+
+
+### Layer 2 — Policy Enforcement (Runtime)
+
+AIP also operates as a transparent proxy between the AI client (Cursor, Claude, VS Code) and the MCP tool server. Every tool call passes through the policy engine before reaching the real tool. Today the proxy enforces YAML-defined policy. As Layer 1 matures, policy decisions will be driven by claims inside the AAT itself — moving from static configuration to cryptographically-grounded authorization.
+
 
 ```mermaid
 graph LR
@@ -82,19 +155,53 @@ sequenceDiagram
     Note over AIP: 📝 Logged to audit trail
 ```
 
+## Goals for what the proxy should do on every call
+
+- Verifies the AAT signature against the AIP registry public key
+- Checks token claims (agent ID, user binding, expiry) against policy
+- Allows, denies, or escalates to a human based on the tool and arguments
+- DLP-scans both the request and the response for sensitive data
+- Writes an immutable audit log entry tied to the agent's verified identity
+
+
+---
+
+## Design Goals
+
+- **Language Agnostic** — supports agents written in Python, JavaScript, Go, Java, Rust, and more
+- **Zero Trust** — no implicit trust between agents or based on network location
+- **Minimal Overhead** — fast token verification without centralized bottlenecks
+- **Compliance Ready** — generates audit trails that satisfy SOC 2, GDPR, HIPAA, and SOX
+- **Developer Friendly** — simple SDK integration that works locally without infrastructure
+
+---
+
+## Core Concepts
+
+| Term | Definition |
+| --- | --- |
+| **Agent** | An autonomous AI system that makes decisions and performs actions |
+| **Agent Identity Document (AID)** | JSON structure defining an agent's cryptographic identity |
+| **Agent Authentication Token (AAT)** | A signed token proving agent identity at runtime |
+| **Registry** | Central directory of registered agents, permissions, capabilities, and federation |
+| **Token Issuer** | Service that generates and signs AATs |
+| **Resource Server** | API or system that agents request access to |
+| **Policy Engine** | Runtime component that evaluates every tool call against defined policy |
+
 ---
 
 ## Why AIP?
 
-| Feature | Standard MCP | AIP-Enabled MCP |
-|---------|--------------|-----------------|
-| **Prompt Injection** | ⚠️ Vulnerable — Executes any command | ✅ Protected — Blocks unauthorized intent |
-| **Data Exfiltration** | ⚠️ Unrestricted internet access | ✅ Egress filtering + DLP redaction |
-| **Consent Fatigue** | ⚠️ Click "Allow" 50 times per session | ✅ Policy-based autonomy |
-| **Audit Trail** | ⚠️ None / stdio logs | ✅ Immutable JSONL structured logs |
-| **Privilege Model** | ⚠️ All-or-nothing API keys | ✅ Per-tool, per-argument validation |
-| **Human-in-the-Loop** | ⚠️ Not supported | ✅ Native OS approval dialogs |
-
+| Feature | Standard MCP | API Keys | AIP |
+| --- | --- | --- | --- |
+| **Agent Identity** | ⚠️ None | ⚠️ User-level only | ✅ Per-agent cryptographic identity |
+| **Prompt Injection** | ⚠️ Vulnerable | ⚠️ Vulnerable | ✅ Policy blocks unauthorized intent |
+| **Authorization Granularity** | ⚠️ All-or-nothing | ⚠️ Scope-level | ✅ Per-tool, per-argument validation |
+| **Audit Trail** | ⚠️ None | ⚠️ Grant-time only | ✅ Immutable JSONL per action |
+| **Human-in-the-Loop** | ⚠️ Not supported | ⚠️ Not supported | ✅ Native OS approval dialogs |
+| **Revocation** | ⚠️ Rotate keys | ⚠️ Rotate keys | ✅ Registry revocation list |
+| **Data Exfiltration** | ⚠️ Unrestricted | ⚠️ Unrestricted | ✅ DLP scanning + egress filtering |
+| **Compliance** | ⚠️ Manual | ⚠️ Partial | ✅ SOC 2, GDPR, HIPAA, SOX ready |
 ---
 
 ## How is AIP Different?
@@ -126,7 +233,7 @@ AIP and workforce AI governance tools solve different problems at different laye
 
 ---
 
-## See It In Action
+## See The Proxy In Action
 
 When an agent attempts a dangerous operation, AIP blocks it immediately:
 

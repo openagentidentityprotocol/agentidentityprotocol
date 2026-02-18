@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg id="Layer_1" xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="0 0 177 24">
+  <!-- Generator: Adobe Illustrator 30.1.0, SVG Export Plug-In . SVG Version: 2.1.1 Build 136)  -->
+  <defs>
+    <style>
+      .st0 {
+        fill: none;
+      }
+
+      .st1, .st2, .st3 {
+        fill: #ebfcf2;
+      }
+
+      .st4, .st3 {
+        isolation: isolate;
+      }
+
+      .st2 {
+        font-size: 12px;
+      }
+
+      .st2, .st3 {
+        font-family: SukhumvitSet-Bold, 'Sukhumvit Set';
+        font-weight: 700;
+      }
+
+      .st3 {
+        font-size: 10.62px;
+      }
+    </style>
+  </defs>
+  <path class="st0" d="M12.61,23.44C6.08,23.44.77,18.34.77,12.06S6.08.67,12.61.67s11.84,5.11,11.84,11.39-5.31,11.39-11.84,11.39Z"/>
+  <path class="st1" d="M12.61,1.24c3,0,5.82,1.12,7.95,3.17,2.12,2.04,3.29,4.76,3.29,7.65s-1.17,5.6-3.29,7.65c-2.12,2.04-4.94,3.17-7.95,3.17s-5.82-1.12-7.95-3.17c-2.12-2.04-3.29-4.76-3.29-7.65s1.17-5.6,3.29-7.65c2.12-2.04,4.94-3.17,7.95-3.17M12.61.09C5.74.09.18,5.45.18,12.06s5.57,11.96,12.43,11.96,12.43-5.35,12.43-11.96S19.47.09,12.61.09h0Z"/>
+  <g class="st4">
+    <text class="st3" transform="translate(12.33 10.96) scale(1.04 1)"><tspan x="0" y="0">AI</tspan></text>
+    <text class="st3" transform="translate(12.33 23.71) scale(1.04 1)"><tspan x="0" y="0">P</tspan></text>
+  </g>
+  <text class="st2" transform="translate(25.44 16.3) scale(.82 1)"><tspan x="0" y="0">OPEN AGENT IDENTITY PROTOCOL</tspan></text>
+</svg>

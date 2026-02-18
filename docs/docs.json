@@ -1,0 +1,87 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "aspen",
+  "name": "Open Agent Identity Protocol",
+  "colors": {
+    "primary": "#16A34A",
+    "light": "#07C983",
+    "dark": "#15803D"
+  },
+  "favicon": "/favicon.svg",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Guides",
+        "groups": [
+          {
+            "group": "Getting started",
+            "pages": [
+              "index"
+            ]
+          },
+          {
+            "group": "About OAIP",
+            "pages": [
+              "architecture"
+            ]
+          },
+          {
+            "group": "Developing with OAIP",
+            "pages": [
+              "SDKs"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Community",
+        "groups": [
+          {
+            "group": "Github",
+            "pages": [
+              "community/introduction"
+            ]
+          },
+          {
+            "group": "Contributing",
+            "pages": [
+              "community/contributing",
+              "community/contributing-policy"
+            ]
+          }
+        ]
+      }
+    ],
+    "global": {
+      "anchors": [
+     
+      ]
+    }
+  },
+  "logo": {
+    "light": "/logo/light.svg",
+    "dark": "/logo/dark.svg"
+  },
+  "navbar": {
+    "primary": {
+      "type": "button",
+      "label": "Github",
+      "href": "https://github.com/openagentidentityprotocol"
+    }
+  },
+  "contextual": {
+    "options": [
+     "copy",
+     "view",
+     "chatgpt",
+     "claude",
+     "perplexity"
+   ]
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/openagentidentityprotocol"
+    }
+  },
+  "description": "The standard for AI agent identity attestation"
+}

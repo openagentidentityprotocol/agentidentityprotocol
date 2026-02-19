@@ -24,12 +24,24 @@
             "group": "About AIP",
             "pages": [
               "architecture",
-              "policy-reference",
+               {
+                "group": "Layer 1 - Identity Attestation",
+                "pages": [
+                  "layer-1-identity/identity-workflow"
+                ]
+              },
+              {
+                "group": "Layer 2 - Enforcement",
+                "pages": [
+                  "layer-2-enforcement/policy-reference"
+                ]
+              },
               {
                 "group": "Specifications",
                 "pages": [
                   "specs/aip-v1alpha1",
-                  "specs/aip-v1alpha2"
+                  "specs/aip-v1alpha2",
+                  "specs/aip-v1alpha3"
                 ]
               },
               "faq"

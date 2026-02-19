@@ -1,0 +1,3093 @@
+---
+title: "AIP v1alpha3"
+---
+
+# Agent Identity Protocol (AIP) Specification
+
+**Version:** v1alpha3
+**Status:** Draft
+**Last Updated:** 2026-02-19
+**Authors:** Eduardo Arango (arangogutierrez@gmail.com), James Cao (james@montcao.com)
+
+---
+
+## Abstract
+
+The Agent Identity Protocol (AIP) defines a standard for identity, authentication, and policy-based authorization of AI agent tool calls. AIP enables runtime environments to enforce fine-grained access control over Model Context Protocol (MCP) tool invocations, providing a security boundary between AI agents and external resources.
+
+This specification defines:
+1. The policy document schema (`AgentPolicy`)
+2. Evaluation semantics for authorization decisions
+3. Agent identity and session management
+4. Server-side validation endpoints
+5. **Agent Authentication Token (AAT) and the identity layer** *(new in v1alpha3)*
+6. **AIP Registry and Token Issuer** *(new in v1alpha3)*
+7. **User binding and delegation** *(new in v1alpha3)*
+8. Error codes for denied requests
+9. Audit log format for compliance
+
+AIP is designed to be implementation-agnostic. Any MCP-compatible runtime (Cursor, Claude Desktop, VS Code, custom implementations) can implement this specification.
+
+---
+
+## Table of Contents
+
+1. [Introduction](#1-introduction)
+2. [Terminology](#2-terminology)
+3. [Policy Document Schema](#3-policy-document-schema)
+4. [Evaluation Semantics](#4-evaluation-semantics)
+5. [Agent Identity](#5-agent-identity)
+6. [Server-Side Validation](#6-server-side-validation)
+7. [Agent Authentication Token (AAT)](#7-agent-authentication-token-aat) *(new in v1alpha3)*
+8. [AIP Registry](#8-aip-registry) *(new in v1alpha3)*
+9. [Token Issuer](#9-token-issuer) *(new in v1alpha3)*
+10. [User Binding and Delegation](#10-user-binding-and-delegation) *(new in v1alpha3)*
+11. [Error Codes](#11-error-codes)
+12. [Audit Log Format](#12-audit-log-format)
+13. [Conformance](#13-conformance)
+14. [Security Considerations](#14-security-considerations)
+15. [IANA Considerations](#15-iana-considerations)
+
+**Appendices**
+- [Appendix A: Complete Schema Reference](#appendix-a-complete-schema-reference)
+- [Appendix B: Changelog](#appendix-b-changelog)
+- [Appendix C: References](#appendix-c-references)
+- [Appendix D: Future Extensions](#appendix-d-future-extensions)
+- [Appendix E: Implementation Notes](#appendix-e-implementation-notes)
+
+---
+
+## 1. Introduction
+
+### 1.1 Motivation
+
+AI agents operating through the Model Context Protocol (MCP) have access to powerful tools: file systems, databases, APIs, and cloud infrastructure. Without a policy layer, agents operate with unrestricted access to any tool the MCP server exposes.
+
+Today, agents are granted full permissions to API keys, secrets, and system resources, running as the user with no distinction between human and non-human actions. There is no universal way to distinguish an AI agent from a human actor. This creates systemic gaps:
+
+- **No audit trail** -- agent actions are indistinguishable from human actions in logs
+- **No revocation** -- once an agent has credentials, there is no standard way to revoke them
+- **No authorization granularity** -- access is all-or-nothing at the API key level
+- **Compliance blind spots** -- SOC 2, GDPR, HIPAA, and SOX requirements are unmet for agentic actions
+
+AIP addresses these gaps through two interconnected layers:
+
+- **Layer 1 -- Identity**: Establishes *who* the agent is via cryptographic identities, Agent Authentication Tokens, and a registry-based root of trust *(formalized in v1alpha3)*
+- **Layer 2 -- Enforcement**: Decides *what* the agent is allowed to do via the AIP Proxy, policy engine, DLP scanning, and audit logging
+
+The **Agent Authentication Token (AAT)** bridges these two layers -- issued by Layer 1, enforced by Layer 2.
+
+AIP introduces:
+- **Capability declaration**: Explicit allowlists of permitted tools
+- **Argument validation**: Regex-based constraints on tool parameters
+- **Human-in-the-loop**: Interactive approval for sensitive operations
+- **Audit trail**: Immutable logging of all authorization decisions
+- **Agent identity**: Cryptographic binding of policies to agent sessions
+- **Server-side validation**: Optional HTTP endpoints for distributed policy enforcement
+- **Agent Authentication Tokens**: Signed tokens carrying agent identity, user delegation, and capabilities *(new in v1alpha3)*
+- **Registry-based root of trust**: Centralized agent registration with revocation *(new in v1alpha3)*
+- **User binding**: Cryptographic proof of which human authorized the agent *(new in v1alpha3)*
+
+### 1.2 Goals
+
+1. **Interoperability**: Any MCP runtime can implement AIP
+2. **Simplicity**: YAML-based policies readable by security teams
+3. **Defense in depth**: Multiple layers (method, tool, argument, identity, AAT)
+4. **Fail-closed**: Unknown tools are denied by default
+5. **Zero-trust ready**: Support for token-based identity verification
+6. **Agent-human distinction**: Separate authentication for agents vs. users *(new in v1alpha3)*
+7. **Cryptographic delegation**: Provable chain from user to agent to action *(new in v1alpha3)*
+
+### 1.3 Non-Goals
+
+The following are explicitly out of scope for **this version** of the specification:
+- Network egress control (see [Appendix D: Future Extensions](#appendix-d-future-extensions))
+- Subprocess sandboxing (implementation-defined)
+- Rate limiting algorithms (implementation-defined)
+- Policy expression languages beyond regex (CEL/Rego - see [Appendix D](#d5-advanced-policy-expressions))
+- Full OIDC/SPIFFE federation (see [Appendix D](#d3-external-identity-federation)); basic integration points are defined
+
+### 1.4 Relationship to MCP
+
+AIP is designed as a security layer for MCP. It intercepts `tools/call` requests and applies policy checks before forwarding to the MCP server.
+
+```
+┌─────────┐     ┌─────────────┐     ┌─────────────┐
+│  Agent  │────▶│ AIP Policy  │────▶│ MCP Server  │
+│         │◀────│   Engine    │◀────│             │
+└─────────┘     └─────────────┘     └─────────────┘
+                      │
+                      ▼
+              ┌─────────────┐
+              │ AIP Server  │  (optional)
+              │  Endpoint   │
+              └─────────────┘
+```
+
+### 1.5 Relationship to MCP Authorization
+
+MCP defines an optional OAuth 2.1-based authorization layer (MCP 2025-06-18 and later). AIP is **complementary** to MCP authorization:
+
+| Concern | MCP Authorization | AIP |
+|---------|-------------------|-----|
+| **Scope** | Transport-level authentication | Tool-level authorization |
+| **What it protects** | Access to MCP server | Access to specific tools |
+| **Token type** | OAuth 2.1 access tokens | Agent Authentication Tokens (AAT) |
+| **Policy language** | OAuth scopes | YAML policy documents |
+| **Identity model** | User identity (OAuth) | Agent + user identity (AAT) |
+
+Implementations MAY use both MCP authorization (for server access) and AIP (for tool access) simultaneously.
+
+### 1.6 Two-Layer Architecture (v1alpha3)
+
+v1alpha3 formalizes the complete two-layer architecture:
+
+```
+         LAYER 1 -- IDENTITY                    LAYER 2 -- ENFORCEMENT
+         (Who is this agent?)                  (What can it do?)
+
++-------------------+                       +-------------------+
+|  AIP Registry     |  (Root of Trust)      |   AI Client       |
+|  Registers Agents |                       | Cursor / Claude   |
+|  Signs Certs      |                       +---------+---------+
++--------+----------+                                 | tool call + AAT
+         | Issues Attestation                         v
+         v                                  +---------------------------+
++-------------------+                       |       AIP Proxy           |
+| Agent Identity    |                       |                           |
+| Document (AID)    |                       | 1. Verify AAT signature   | <-- Registry
+|  (Public Key)     |                       | 2. Check revocation list  |     (revocation)
++---------+---------+                       | 3. Validate user binding  |
+          | Signs Token Requests            | 4. Check AAT capabilities |
+          v                                 | 5. Evaluate local policy  |
++-------------------+                       | 6. DLP scan               |
+|  Token Issuer     |                       | 7. Audit log              |
+|  Validates ID     |      AAT             +---------+-----------------+
+|  Binds User       | ---------------------->         | ALLOW / DENY
+|  Issues AAT       |                                 v
++-------------------+                       +-------------------+
+                                            |   Real Tool       |
+                                            | Docker/Postgres   |
+                                            | GitHub / etc.     |
+                                            +-------------------+
+```
+
+**Flow**:
+1. Agent registers with the AIP Registry, receiving a key pair and Agent Identity Document (AID)
+2. When a user authorizes an agent, the Token Issuer validates the agent's identity and issues an AAT encoding agent ID, user binding, and capabilities
+3. On every tool call, the AIP Proxy verifies the AAT, checks the registry revocation list, evaluates policy, performs DLP scanning, and writes an audit log entry
+4. A hijacked agent fails at Layer 2 -- its AAT claims do not match the attempted action
+5. A revoked agent fails at Layer 2 -- the proxy checks the registry revocation list on every call
+6. A legitimate agent passes through both layers with a full audit trail tied to its verified identity
+
+---
+
+## 2. Terminology
+
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119).
+
+| Term | Definition |
+|------|------------|
+| **Agent** | An AI system that invokes MCP tools on behalf of a user |
+| **Agent Identity Document (AID)** | JSON structure defining an agent's cryptographic identity *(new)* |
+| **Agent Authentication Token (AAT)** | A signed token proving agent identity, user delegation, and capabilities at runtime *(new)* |
+| **AIP Registry** | Central directory of registered agents and their public keys *(new)* |
+| **Token Issuer** | Service that validates agent identity and issues AATs *(new)* |
+| **Policy** | A document specifying authorization rules (AgentPolicy) |
+| **Tool** | An MCP tool exposed by an MCP server |
+| **Decision** | The result of policy evaluation: ALLOW, BLOCK, or ASK |
+| **Violation** | A policy rule was triggered (may or may not block) |
+| **Session** | A bounded period of agent activity with consistent identity |
+| **Identity Token** | A cryptographic token binding policy to session (v1alpha2; superseded by AAT for cross-service use) |
+| **Policy Hash** | SHA-256 hash of the canonical policy document |
+| **User Binding** | Cryptographic proof linking an agent's actions to an authorizing user *(new)* |
+| **Capability** | A declared permission encoded in an AAT (e.g., tool access, resource scope) *(new)* |
+| **Delegation Chain** | The provable path from user authorization through agent to action *(new)* |
+| **Revocation List** | Registry-maintained list of revoked agents, AATs, and sessions *(new)* |
+
+---
+
+## 3. Policy Document Schema
+
+### 3.1 Document Structure
+
+An AIP policy document is a YAML file with the following top-level structure:
+
+```yaml
+apiVersion: aip.io/v1alpha3
+kind: AgentPolicy
+metadata:
+  name: <string>
+  version: <string>           # OPTIONAL
+  owner: <string>             # OPTIONAL
+  signature: <string>         # OPTIONAL
+spec:
+  mode: <string>              # OPTIONAL, default: "enforce"
+  allowed_tools: [<string>]   # OPTIONAL
+  allowed_methods: [<string>] # OPTIONAL
+  denied_methods: [<string>]  # OPTIONAL
+  tool_rules: [<ToolRule>]    # OPTIONAL
+  protected_paths: [<string>] # OPTIONAL
+  strict_args_default: <bool> # OPTIONAL, default: false
+  dlp: <DLPConfig>            # OPTIONAL
+  identity: <IdentityConfig>  # OPTIONAL
+  server: <ServerConfig>      # OPTIONAL
+  registry: <RegistryConfig>  # OPTIONAL (v1alpha3)
+  aat: <AATConfig>            # OPTIONAL (v1alpha3)
+```
+
+### 3.2 Required Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `apiVersion` | string | MUST be `aip.io/v1alpha3` |
+| `kind` | string | MUST be `AgentPolicy` |
+| `metadata.name` | string | Unique identifier for this policy |
+
+### 3.3 Metadata
+
+```yaml
+metadata:
+  name: <string>        # REQUIRED - Policy identifier
+  version: <string>     # OPTIONAL - Semantic version (e.g., "1.0.0")
+  owner: <string>       # OPTIONAL - Contact email
+  signature: <string>   # OPTIONAL - Policy signature
+```
+
+#### 3.3.1 Policy Signature
+
+The `signature` field provides cryptographic integrity verification for the policy document.
+
+Format: `<algorithm>:<base64-encoded-signature>`
+
+Supported algorithms:
+- `ed25519` - Ed25519 signature (RECOMMENDED)
+
+Example:
+```yaml
+metadata:
+  name: production-agent
+  signature: "ed25519:YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXo..."
+```
+
+When present, implementations MUST verify the signature before applying the policy. Signature verification failure MUST result in policy rejection.
+
+The signature is computed over the **canonical form** of the policy document (see Section 5.2.1).
+
+### 3.4 Spec Fields
+
+*[Sections 3.4.1 through 3.4.6 remain unchanged from v1alpha2]*
+
+#### 3.4.1 mode
+
+Controls enforcement behavior.
+
+| Value | Behavior |
+|-------|----------|
+| `enforce` | Violations are blocked (default) |
+| `monitor` | Violations are logged but allowed |
+
+Implementations MUST support both modes.
+
+#### 3.4.2 allowed_tools
+
+A list of tool names that the agent MAY invoke.
+
+```yaml
+allowed_tools:
+  - github_get_repo
+  - read_file
+  - list_directory
+```
+
+Tool names are subject to normalization (see Section 4.1).
+
+#### 3.4.3 allowed_methods
+
+A list of JSON-RPC methods that are permitted. If not specified, implementations MUST use the default safe list:
+
+```yaml
+# Default allowed methods (when not specified)
+allowed_methods:
+  - initialize
+  - initialized
+  - ping
+  - tools/call
+  - tools/list
+  - completion/complete
+  - notifications/initialized
+  - notifications/progress
+  - notifications/message
+  - notifications/resources/updated
+  - notifications/resources/list_changed
+  - notifications/tools/list_changed
+  - notifications/prompts/list_changed
+  - cancelled
+```
+
+The wildcard `*` MAY be used to allow all methods.
+
+#### 3.4.4 denied_methods
+
+A list of JSON-RPC methods that are explicitly denied. Denied methods take precedence over allowed methods.
+
+```yaml
+denied_methods:
+  - resources/read
+  - resources/write
+```
+
+#### 3.4.5 protected_paths
+
+A list of file paths that tools MUST NOT access. Any tool argument containing a protected path MUST be blocked.
+
+```yaml
+protected_paths:
+  - ~/.ssh
+  - ~/.aws/credentials
+  - .env
+```
+
+Implementations MUST:
+- Expand `~` to the user's home directory
+- Automatically protect the policy file itself
+
+#### 3.4.6 strict_args_default
+
+When `true`, tool rules reject any arguments not explicitly declared in `allow_args`.
+
+Default: `false`
+
+### 3.5 Tool Rules
+
+Tool rules provide fine-grained control over specific tools.
+
+```yaml
+tool_rules:
+  - tool: <string>              # REQUIRED - Tool name
+    action: <string>            # OPTIONAL - allow|block|ask (default: allow)
+    rate_limit: <string>        # OPTIONAL - e.g., "10/minute"
+    strict_args: <bool>         # OPTIONAL - Override strict_args_default
+    schema_hash: <string>       # OPTIONAL - Tool schema integrity
+    allow_args:                 # OPTIONAL
+      <arg_name>: <regex>
+```
+
+#### 3.5.1 Actions
+
+| Action | Behavior |
+|--------|----------|
+| `allow` | Permit (subject to argument validation) |
+| `block` | Deny unconditionally |
+| `ask` | Require interactive user approval |
+
+#### 3.5.2 Rate Limiting
+
+Format: `<count>/<period>`
+
+| Period | Aliases |
+|--------|---------|
+| `second` | `sec`, `s` |
+| `minute` | `min`, `m` |
+| `hour` | `hr`, `h` |
+
+Example: `"10/minute"`, `"100/hour"`, `"5/second"`
+
+Rate limiting algorithm is implementation-defined (token bucket, sliding window, etc.).
+
+#### 3.5.3 Argument Validation
+
+The `allow_args` field maps argument names to regex patterns.
+
+```yaml
+allow_args:
+  url: "^https://github\\.com/.*"
+  query: "^SELECT\\s+.*"
+```
+
+Implementations MUST:
+- Use a regex engine with linear-time guarantees (RE2 or equivalent)
+- Match against the string representation of the argument value
+- Treat missing constrained arguments as a violation
+
+#### 3.5.4 Tool Schema Hashing
+
+The `schema_hash` field provides cryptographic verification of tool definitions to prevent tool poisoning attacks.
+
+**Format**: `<algorithm>:<hex-digest>`
+
+**Supported algorithms**:
+- `sha256` (RECOMMENDED)
+- `sha384`
+- `sha512`
+
+**Hash computation**:
+
+```
+TOOL_SCHEMA_HASH(tool):
+  schema = {
+    "name": tool.name,
+    "description": tool.description,
+    "inputSchema": tool.inputSchema
+  }
+  canonical = JSON_CANONICALIZE(schema)  # RFC 8785
+  hash = SHA256(canonical)
+  RETURN "sha256:" + hex_encode(hash)
+```
+
+| Condition | Behavior |
+|-----------|----------|
+| `schema_hash` absent | No schema verification (backward compatible) |
+| Hash matches | Tool allowed (proceed to argument validation) |
+| Hash mismatch | Tool BLOCKED with error -32013 |
+| Tool not found | Tool BLOCKED with error -32001 |
+
+### 3.6 DLP Configuration
+
+*[Section 3.6 remains unchanged from v1alpha2]*
+
+Data Loss Prevention (DLP) scans for sensitive data in requests and responses.
+
+```yaml
+dlp:
+  enabled: <bool>             # OPTIONAL, default: true when dlp block present
+  scan_requests: <bool>       # OPTIONAL, default: false
+  scan_responses: <bool>      # OPTIONAL, default: true
+  detect_encoding: <bool>     # OPTIONAL, default: false
+  filter_stderr: <bool>       # OPTIONAL, default: false
+  max_scan_size: <string>     # OPTIONAL, default: "1MB"
+  on_request_match: <string>  # OPTIONAL, default: "block"
+  on_redaction_failure: <string>    # OPTIONAL, default: "block"
+  log_original_on_failure: <bool>   # OPTIONAL, default: false
+  patterns:
+    - name: <string>          # REQUIRED - Rule identifier
+      regex: <string>         # REQUIRED - Detection pattern
+      scope: <string>         # OPTIONAL, default: "all" (request|response|all)
+```
+
+When a pattern matches, the matched content MUST be replaced with:
+```
+[REDACTED:<name>]
+```
+
+### 3.7 Identity Configuration
+
+*[Section 3.7 remains unchanged from v1alpha2]*
+
+The `identity` section configures agent identity and token management.
+
+```yaml
+spec:
+  identity:
+    enabled: <bool>           # OPTIONAL, default: false
+    token_ttl: <duration>     # OPTIONAL, default: "5m"
+    rotation_interval: <duration>  # OPTIONAL, default: "4m"
+    require_token: <bool>     # OPTIONAL, default: false
+    session_binding: <string> # OPTIONAL, default: "process"
+    nonce_window: <duration>  # OPTIONAL, default: equals token_ttl
+    policy_transition_grace: <duration>  # OPTIONAL, default: "0s"
+    audience: <string>        # OPTIONAL, default: policy metadata.name
+    nonce_storage: <NonceStorageConfig>  # OPTIONAL
+    keys: <KeyConfig>         # OPTIONAL
+```
+
+### 3.8 Server Configuration
+
+*[Section 3.8 remains unchanged from v1alpha2]*
+
+```yaml
+spec:
+  server:
+    enabled: <bool>           # OPTIONAL, default: false
+    listen: <string>          # OPTIONAL, default: "127.0.0.1:9443"
+    failover_mode: <string>   # OPTIONAL, default: "fail_closed"
+    timeout: <duration>       # OPTIONAL, default: "5s"
+    tls:
+      cert: <string>
+      key: <string>
+    endpoints:
+      validate: <string>      # default: "/v1/validate"
+      revoke: <string>        # default: "/v1/revoke"
+      jwks: <string>          # default: "/v1/jwks"
+      health: <string>        # default: "/health"
+      metrics: <string>       # default: "/metrics"
+```
+
+### 3.9 Registry Configuration (v1alpha3)
+
+The `registry` section configures how the AIP Proxy connects to the AIP Registry for agent verification and revocation checks.
+
+```yaml
+spec:
+  registry:
+    enabled: <bool>                 # OPTIONAL, default: false
+    endpoint: <string>              # REQUIRED if enabled - Registry URL
+    tls:                            # OPTIONAL
+      ca_cert: <string>            # Path to CA certificate for registry
+      client_cert: <string>        # Path to client certificate (mTLS)
+      client_key: <string>         # Path to client key (mTLS)
+    cache:                          # OPTIONAL
+      enabled: <bool>              # default: true
+      ttl: <duration>              # default: "5m"
+      max_entries: <int>           # default: 10000
+    revocation:                     # OPTIONAL
+      check_interval: <duration>   # default: "30s"
+      mode: <string>               # "online" | "cached" | "crl"
+      crl_path: <string>           # Path to local CRL file (if mode=crl)
+    auth:                           # OPTIONAL
+      type: <string>               # "bearer" | "mtls" | "api_key"
+      token: <string>              # Bearer token for registry access
+      api_key: <string>            # API key for registry access
+```
+
+#### 3.9.1 enabled
+
+When `true`, the AIP Proxy connects to an AIP Registry for agent identity verification and revocation checking.
+
+Default: `false`
+
+When `registry.enabled: true`, the proxy MUST verify AATs against the registry's known agent keys before applying local policy.
+
+#### 3.9.2 endpoint
+
+The URL of the AIP Registry.
+
+Format: `https://<host>:<port>`
+
+Example:
+```yaml
+registry:
+  enabled: true
+  endpoint: "https://registry.aip.example.com"
+```
+
+#### 3.9.3 Revocation Modes
+
+| Mode | Description | Latency | Freshness |
+|------|-------------|---------|-----------|
+| `online` | Check registry on every AAT validation | High | Real-time |
+| `cached` | Cache revocation list, refresh periodically (default) | Low | Eventual |
+| `crl` | Load Certificate Revocation List from local file | Lowest | Manual |
+
+**online** (highest security):
+```yaml
+registry:
+  revocation:
+    mode: "online"
+```
+- Every AAT validation queries the registry
+- Highest security, highest latency
+- Requires reliable network connectivity
+
+**cached** (RECOMMENDED for production):
+```yaml
+registry:
+  revocation:
+    mode: "cached"
+    check_interval: "30s"
+```
+- Background refresh of revocation list
+- Trades freshness for performance
+- Revocations take effect within `check_interval`
+
+**crl** (air-gapped or offline environments):
+```yaml
+registry:
+  revocation:
+    mode: "crl"
+    crl_path: "/etc/aip/revocation.crl"
+    check_interval: "5m"  # Re-read CRL file
+```
+- CRL file updated by external process
+- No network dependency
+- Manual revocation propagation
+
+#### 3.9.4 Cache Configuration
+
+```yaml
+registry:
+  cache:
+    enabled: true
+    ttl: "5m"
+    max_entries: 10000
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `true` | Cache agent public keys and revocation status |
+| `ttl` | duration | `"5m"` | Cache entry time-to-live |
+| `max_entries` | int | `10000` | Maximum cached entries (LRU eviction) |
+
+### 3.10 AAT Configuration (v1alpha3)
+
+The `aat` section configures how the AIP Proxy validates and uses Agent Authentication Tokens.
+
+```yaml
+spec:
+  aat:
+    enabled: <bool>               # OPTIONAL, default: false
+    require: <bool>               # OPTIONAL, default: false
+    validation:                   # OPTIONAL
+      verify_signature: <bool>    # default: true
+      verify_user_binding: <bool> # default: true
+      verify_capabilities: <bool> # default: true
+      max_token_age: <duration>   # default: "1h"
+      clock_skew: <duration>      # default: "30s"
+    capabilities_mode: <string>   # OPTIONAL, default: "intersect"
+    trusted_issuers: [<string>]   # OPTIONAL - List of trusted Token Issuer IDs
+    header_name: <string>         # OPTIONAL, default: "X-AIP-AAT"
+```
+
+#### 3.10.1 enabled
+
+When `true`, the proxy accepts and validates AATs on incoming requests.
+
+Default: `false`
+
+#### 3.10.2 require
+
+When `true`, all tool calls MUST include a valid AAT. Calls without AATs are rejected with error code -32015.
+
+Default: `false`
+
+This enables gradual rollout: start with `require: false` to validate AATs when present without blocking requests that lack them.
+
+#### 3.10.3 capabilities_mode
+
+Determines how AAT capabilities interact with local policy.
+
+| Value | Behavior |
+|-------|----------|
+| `intersect` | Tool must be allowed by BOTH AAT capabilities and local policy (default) |
+| `aat_only` | AAT capabilities replace local `allowed_tools` |
+| `policy_only` | Local policy only; AAT used for identity/audit only |
+
+**intersect** (RECOMMENDED):
+```yaml
+aat:
+  capabilities_mode: "intersect"
+```
+- Most restrictive: requires both AAT and local policy to allow the tool
+- Defense in depth: neither AAT compromise nor policy compromise alone grants access
+
+**aat_only** (registry-managed environments):
+```yaml
+aat:
+  capabilities_mode: "aat_only"
+```
+- Centralized capability management via Token Issuer
+- Local policy still enforces argument validation, DLP, and rate limiting
+- `allowed_tools` in local policy is IGNORED
+
+**policy_only** (audit-focused deployments):
+```yaml
+aat:
+  capabilities_mode: "policy_only"
+```
+- AAT used only for identity verification and audit trail enrichment
+- Local policy controls all authorization decisions
+- Simplest migration path from v1alpha2
+
+#### 3.10.4 trusted_issuers
+
+A list of Token Issuer identifiers whose AATs are accepted by this proxy.
+
+```yaml
+aat:
+  trusted_issuers:
+    - "https://issuer.aip.example.com"
+    - "https://issuer.aip.corp.internal"
+```
+
+When specified, the proxy MUST reject AATs from issuers not in this list. When not specified, the proxy accepts AATs from any issuer whose public key can be verified via the registry.
+
+#### 3.10.5 header_name
+
+The HTTP header or JSON-RPC extension field used to transmit AATs.
+
+Default: `"X-AIP-AAT"`
+
+For JSON-RPC transport (stdio), the AAT is included in the request params:
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "params": {
+    "name": "read_file",
+    "arguments": {"path": "/etc/hosts"},
+    "_aip_aat": "<base64url-encoded-aat>"
+  }
+}
+```
+
+For HTTP transport, the AAT is sent as a header:
+```http
+POST /v1/validate HTTP/1.1
+X-AIP-AAT: <base64url-encoded-aat>
+```
+
+The `_aip_aat` parameter is reserved by this specification and MUST NOT be forwarded to the MCP server.
+
+---
+
+## 4. Evaluation Semantics
+
+### 4.1 Name Normalization
+
+Tool names and method names MUST be normalized before comparison using the following algorithm:
+
+```
+NORMALIZE(input):
+  1. Apply NFKC Unicode normalization
+  2. Convert to lowercase
+  3. Trim leading/trailing whitespace
+  4. Remove non-printable and control characters
+  5. Return result
+```
+
+### 4.2 Method-Level Authorization
+
+Method authorization is the FIRST line of defense, evaluated BEFORE tool-level checks.
+
+```
+IS_METHOD_ALLOWED(method):
+  normalized = NORMALIZE(method)
+
+  IF normalized IN denied_methods:
+    RETURN DENY
+
+  IF "*" IN allowed_methods:
+    RETURN ALLOW
+
+  IF normalized IN allowed_methods:
+    RETURN ALLOW
+
+  RETURN DENY
+```
+
+### 4.3 Tool-Level Authorization
+
+Tool authorization applies to `tools/call` requests.
+
+```
+IS_TOOL_ALLOWED(tool_name, arguments, identity_token, aat):
+  normalized = NORMALIZE(tool_name)
+
+  # Step 0: Verify identity token (if configured)
+  IF identity.require_token:
+    IF identity_token IS EMPTY OR NOT valid_token(identity_token):
+      RETURN TOKEN_REQUIRED
+
+  # Step 0b: Verify AAT (v1alpha3)
+  IF aat.require:
+    IF aat IS EMPTY:
+      RETURN AAT_REQUIRED
+    IF NOT valid_aat(aat):
+      RETURN AAT_INVALID
+  ELSE IF aat IS PRESENT:
+    # Validate opportunistically even when not required
+    IF NOT valid_aat(aat):
+      LOG_WARNING("Invalid AAT presented but not required")
+
+  # Step 0c: Check AAT capabilities (v1alpha3)
+  IF aat IS PRESENT AND aat IS VALID:
+    IF aat.capabilities_mode == "intersect":
+      IF normalized NOT IN aat.capabilities:
+        RETURN AAT_CAPABILITY_DENIED
+    ELSE IF aat.capabilities_mode == "aat_only":
+      IF normalized NOT IN aat.capabilities:
+        RETURN AAT_CAPABILITY_DENIED
+      SKIP local allowed_tools check (Step 4)
+
+  # Step 1: Check rate limiting
+  IF rate_limiter_exceeded(normalized):
+    RETURN RATE_LIMITED
+
+  # Step 2: Check protected paths
+  IF arguments_contain_protected_path(arguments):
+    RETURN PROTECTED_PATH
+
+  # Step 3: Check tool rules
+  rule = find_rule(normalized)
+  IF rule EXISTS:
+    IF rule.action == "block":
+      RETURN BLOCK
+    IF rule.action == "ask":
+      IF validate_arguments(rule, arguments):
+        RETURN ASK
+      ELSE:
+        RETURN BLOCK
+
+  # Step 4: Check allowed_tools list (skipped if aat_only mode)
+  IF aat.capabilities_mode != "aat_only":
+    IF normalized NOT IN allowed_tools:
+      RETURN BLOCK
+
+  # Step 5: Validate arguments (if rule exists)
+  IF rule EXISTS AND rule.allow_args NOT EMPTY:
+    IF NOT validate_arguments(rule, arguments):
+      RETURN BLOCK
+
+  # Step 6: Strict args check
+  IF strict_args_enabled(rule):
+    IF arguments has undeclared keys:
+      RETURN BLOCK
+
+  RETURN ALLOW
+```
+
+### 4.4 Decision Outcomes
+
+| Decision | Mode=enforce | Mode=monitor |
+|----------|--------------|--------------|
+| ALLOW | Forward request | Forward request |
+| BLOCK | Return error | Forward request, log violation |
+| ASK | Prompt user | Prompt user |
+| RATE_LIMITED | Return error | Return error (always enforced) |
+| PROTECTED_PATH | Return error | Return error (always enforced) |
+| TOKEN_REQUIRED | Return error | Return error (always enforced) |
+| TOKEN_INVALID | Return error | Return error (always enforced) |
+| AAT_REQUIRED | Return error | Return error (always enforced) *(new)* |
+| AAT_INVALID | Return error | Return error (always enforced) *(new)* |
+| AAT_CAPABILITY_DENIED | Return error | Forward request, log violation *(new)* |
+
+### 4.5 Argument Validation
+
+```
+VALIDATE_ARGUMENTS(rule, arguments):
+  FOR EACH (arg_name, pattern) IN rule.allow_args:
+    IF arg_name NOT IN arguments:
+      RETURN FALSE  # Required argument missing
+
+    value = STRING(arguments[arg_name])
+    IF NOT REGEX_MATCH(pattern, value):
+      RETURN FALSE
+
+  RETURN TRUE
+```
+
+The `STRING()` function converts values to string representation:
+- String -> as-is
+- Number -> decimal representation
+- Boolean -> "true" or "false"
+- Null -> empty string
+- Array/Object -> JSON serialization
+
+---
+
+## 5. Agent Identity
+
+*[Section 5 remains unchanged from v1alpha2]*
+
+This section defines the local agent identity model introduced in v1alpha2. In v1alpha3, local identity tokens and AATs serve complementary roles: identity tokens bind the proxy session, while AATs carry cross-service agent identity.
+
+### 5.1 Overview
+
+Agent identity provides:
+1. **Session binding**: Cryptographic proof that requests belong to the same session
+2. **Policy integrity**: Verification that the policy hasn't changed mid-session
+3. **Replay prevention**: Nonces prevent token reuse across sessions
+4. **Audit correlation**: Session IDs link related audit events
+
+### 5.2 Policy Hash
+
+#### 5.2.1 Canonical Form
+
+```
+CANONICALIZE(policy):
+  1. Remove metadata.signature field (if present)
+  2. Serialize to JSON using RFC 8785 (JSON Canonicalization Scheme)
+  3. Return UTF-8 encoded bytes
+```
+
+#### 5.2.2 Hash Computation
+
+```
+POLICY_HASH(policy):
+  canonical = CANONICALIZE(policy)
+  hash = SHA-256(canonical)
+  RETURN hex_encode(hash)
+```
+
+### 5.3 Identity Token Structure
+
+*[Remains unchanged from v1alpha2]*
+
+### 5.4 Token Lifecycle
+
+*[Remains unchanged from v1alpha2]*
+
+### 5.5 Session Management
+
+*[Remains unchanged from v1alpha2]*
+
+### 5.6 Token and Session Revocation
+
+*[Remains unchanged from v1alpha2]*
+
+### 5.7 Compatibility with Agentic JWT
+
+*[Remains unchanged from v1alpha2]*
+
+### 5.8 Key Management
+
+*[Remains unchanged from v1alpha2]*
+
+---
+
+## 6. Server-Side Validation
+
+*[Section 6 remains unchanged from v1alpha2, with the addition of AAT-aware endpoints]*
+
+### 6.1 Overview
+
+The AIP server provides:
+1. **Remote validation**: Validate tool calls from external systems
+2. **Health checks**: Integration with load balancers and orchestrators
+3. **Metrics**: Prometheus-compatible metrics export
+4. **AAT validation**: Verify Agent Authentication Tokens *(new in v1alpha3)*
+
+### 6.2 Validation Endpoint
+
+#### 6.2.1 Request Format
+
+```http
+POST /v1/validate HTTP/1.1
+Host: aip-server:9443
+Content-Type: application/json
+Authorization: Bearer <identity-token>
+X-AIP-AAT: <agent-authentication-token>
+
+{
+  "tool": "<tool-name>",
+  "arguments": { ... }
+}
+```
+
+When both an identity token and an AAT are present, the proxy MUST validate both. The identity token authenticates the proxy session; the AAT authenticates the agent.
+
+#### 6.2.2 Response Format
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "decision": "allow|block|ask",
+  "reason": "<human-readable-reason>",
+  "violations": [
+    {
+      "type": "<violation-type>",
+      "field": "<field-name>",
+      "message": "<description>"
+    }
+  ],
+  "token_status": {
+    "valid": true,
+    "expires_in": 240
+  },
+  "aat_status": {
+    "valid": true,
+    "agent_id": "<agent-id>",
+    "user_id": "<user-id>",
+    "capabilities_checked": true,
+    "issuer": "<issuer-id>"
+  }
+}
+```
+
+### 6.3 Health Endpoint
+
+*[Remains unchanged from v1alpha2]*
+
+### 6.4 Metrics Endpoint
+
+Updated metrics (v1alpha3 additions):
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `aip_requests_total` | counter | Total validation requests |
+| `aip_decisions_total` | counter | Decisions by type (allow/block/ask) |
+| `aip_violations_total` | counter | Policy violations by type |
+| `aip_token_validations_total` | counter | Identity token validations (valid/invalid) |
+| `aip_aat_validations_total` | counter | AAT validations (valid/invalid/expired/revoked) *(new)* |
+| `aip_registry_checks_total` | counter | Registry revocation checks *(new)* |
+| `aip_registry_latency_seconds` | histogram | Registry check latency *(new)* |
+| `aip_revocations_total` | counter | Revocation events by type |
+| `aip_active_sessions` | gauge | Currently active sessions |
+| `aip_active_agents` | gauge | Currently active agents (by AAT) *(new)* |
+| `aip_request_duration_seconds` | histogram | Request latency |
+| `aip_policy_hash` | gauge | Current policy hash (as label) |
+
+### 6.5 Revocation Endpoint
+
+*[Remains unchanged from v1alpha2]*
+
+### 6.6 Authentication
+
+*[Remains unchanged from v1alpha2]*
+
+---
+
+## 7. Agent Authentication Token (AAT) (v1alpha3)
+
+This section defines the Agent Authentication Token -- the core credential bridging Layer 1 (Identity) and Layer 2 (Enforcement).
+
+### 7.1 Overview
+
+The AAT carries signed claims about an agent:
+1. **Who issued its identity** -- the Token Issuer
+2. **Which user it is acting on behalf of** -- user binding
+3. **What capabilities it declared** -- tools and resource scopes
+4. **When it was issued and when it expires** -- temporal bounds
+
+The AAT enables:
+- **Per-agent identity**: Every agent has a distinct cryptographic identity, separate from the user
+- **User delegation**: Actions are provably linked to the authorizing human
+- **Capability-based authorization**: AAT capabilities can drive policy decisions
+- **Cross-service portability**: AATs are verifiable by any party with access to the issuer's public key
+
+### 7.2 AAT Structure
+
+An AAT is a signed JWT (RFC 7519) with the following claims:
+
+```json
+{
+  "aat_version": "aip/v1alpha3",
+  "iss": "<token-issuer-id>",
+  "sub": "<agent-id>",
+  "aud": "<target-service-or-proxy>",
+  "iat": 1708300800,
+  "exp": 1708304400,
+  "nbf": 1708300800,
+  "jti": "<unique-token-id>",
+
+  "agent": {
+    "id": "<agent-id>",
+    "name": "<human-readable-agent-name>",
+    "public_key_thumbprint": "<sha256-of-agent-public-key>",
+    "aid_hash": "<sha256-of-agent-identity-document>"
+  },
+
+  "user_binding": {
+    "user_id": "<user-identifier>",
+    "auth_method": "<how-user-authenticated>",
+    "auth_time": 1708300000,
+    "delegation_scope": "<scope-of-delegation>"
+  },
+
+  "capabilities": {
+    "tools": ["<tool-name>", ...],
+    "resource_scopes": ["<scope>", ...],
+    "max_calls_per_session": <int>,
+    "allowed_servers": ["<mcp-server-id>", ...]
+  },
+
+  "context": {
+    "session_id": "<uuid>",
+    "policy_hash": "<64-char-hex>",
+    "registry_id": "<registry-identifier>"
+  }
+}
+```
+
+### 7.3 AAT Claims
+
+#### 7.3.1 Standard JWT Claims
+
+| Claim | Type | Required | Description |
+|-------|------|----------|-------------|
+| `aat_version` | string | Yes | MUST be `aip/v1alpha3` |
+| `iss` | string | Yes | Token Issuer identifier (URI) |
+| `sub` | string | Yes | Agent identifier (from AID) |
+| `aud` | string/array | Yes | Intended recipient(s) -- proxy or MCP server |
+| `iat` | number | Yes | Issued-at time (Unix timestamp) |
+| `exp` | number | Yes | Expiration time (Unix timestamp) |
+| `nbf` | number | No | Not-before time (Unix timestamp) |
+| `jti` | string | Yes | Unique token identifier (UUID v4) |
+
+#### 7.3.2 Agent Claims
+
+The `agent` object identifies the AI agent:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `id` | string | Yes | Unique agent identifier (from registry) |
+| `name` | string | No | Human-readable name (e.g., "Cursor IDE Agent") |
+| `public_key_thumbprint` | string | Yes | SHA-256 of agent's public key (JWK Thumbprint, RFC 7638) |
+| `aid_hash` | string | No | SHA-256 of the Agent Identity Document |
+
+The `public_key_thumbprint` allows the proxy to verify that the AAT was issued for the specific agent key pair, preventing AAT theft across agents.
+
+#### 7.3.3 User Binding Claims
+
+The `user_binding` object links the agent's actions to the authorizing human:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `user_id` | string | Yes | User identifier (email, OIDC sub, or opaque ID) |
+| `auth_method` | string | Yes | How the user authenticated (see below) |
+| `auth_time` | number | Yes | When the user authenticated (Unix timestamp) |
+| `delegation_scope` | string | No | Scope of delegation granted to the agent |
+
+**auth_method values**:
+
+| Value | Description |
+|-------|-------------|
+| `oidc` | OpenID Connect authentication |
+| `oauth2` | OAuth 2.0 authorization code flow |
+| `api_key` | API key associated with a user |
+| `local` | Local system user (process owner) |
+| `saml` | SAML assertion |
+| `attestation` | Hardware or platform attestation |
+
+**delegation_scope values**:
+
+| Value | Description |
+|-------|-------------|
+| `full` | Agent can perform any action the user could (NOT RECOMMENDED) |
+| `tools` | Agent can use specific tools listed in `capabilities.tools` |
+| `read_only` | Agent can only use read operations |
+| `session` | Delegation valid for this session only |
+| `custom:<scope>` | Implementation-defined scope |
+
+#### 7.3.4 Capabilities Claims
+
+The `capabilities` object declares what the agent is authorized to do:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `tools` | []string | No | List of tool names the agent may invoke |
+| `resource_scopes` | []string | No | Resource access scopes (e.g., `repo:read`, `db:write`) |
+| `max_calls_per_session` | int | No | Maximum tool calls allowed in this session |
+| `allowed_servers` | []string | No | MCP server identifiers this AAT is valid for |
+
+**Capability resolution** (how AAT capabilities interact with local policy):
+
+```
+RESOLVE_CAPABILITIES(aat, local_policy, mode):
+  IF mode == "intersect":
+    RETURN INTERSECTION(aat.capabilities.tools, local_policy.allowed_tools)
+
+  IF mode == "aat_only":
+    RETURN aat.capabilities.tools
+
+  IF mode == "policy_only":
+    RETURN local_policy.allowed_tools
+```
+
+**resource_scopes**:
+
+Resource scopes follow a `<resource>:<action>` format:
+
+```json
+{
+  "resource_scopes": [
+    "repo:read",
+    "repo:write",
+    "db:read",
+    "file:/home/user/**:read",
+    "api:github.com:*"
+  ]
+}
+```
+
+Resource scopes are advisory in v1alpha3. Future versions MAY make them enforceable.
+
+#### 7.3.5 Context Claims
+
+The `context` object provides operational context:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `session_id` | string | Yes | Session UUID (matches identity token session) |
+| `policy_hash` | string | No | SHA-256 hash of the policy the issuer approved |
+| `registry_id` | string | No | Registry that holds the agent's registration |
+
+### 7.4 AAT Signing
+
+AATs MUST be signed using one of the following algorithms (in order of preference):
+
+| Algorithm | Key Type | Recommendation |
+|-----------|----------|----------------|
+| `ES256` | ECDSA P-256 | **Default, RECOMMENDED** |
+| `ES384` | ECDSA P-384 | High-security environments |
+| `EdDSA` | Ed25519 | Performance-critical |
+| `RS256` | RSA 2048+ | Legacy compatibility |
+
+AATs MUST NOT use symmetric algorithms (`HS256`) as they require shared secrets.
+
+JWT Header:
+```json
+{
+  "alg": "ES256",
+  "typ": "aat+jwt",
+  "kid": "<key-id-of-issuer-signing-key>"
+}
+```
+
+The `kid` MUST reference a key in the Token Issuer's JWKS endpoint or the AIP Registry's key store.
+
+### 7.5 AAT Lifecycle
+
+```
+┌──────────────┐
+│  User Grants  │
+│  Delegation   │
+└──────┬───────┘
+       │
+       ▼
+┌──────────────┐     ┌──────────────┐
+│ Token Issuer │────▶│   Active     │
+│  Issues AAT  │     │     AAT      │
+└──────────────┘     └──────┬───────┘
+                            │
+       ┌────────────────────┼────────────────────┐
+       │                    │                    │
+       ▼                    ▼                    ▼
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│   Refresh    │     │   Expired    │     │   Revoked    │
+│   (new AAT)  │     │   (reject)   │     │  (by registry│
+└──────────────┘     └──────────────┘     │  or issuer)  │
+                                          └──────────────┘
+```
+
+#### 7.5.1 AAT Issuance
+
+1. Agent authenticates to Token Issuer using its private key (proof of possession)
+2. User authorization is verified (OAuth flow, API key lookup, or local attestation)
+3. Token Issuer retrieves agent registration from AIP Registry
+4. Token Issuer constructs AAT with agent identity, user binding, and capabilities
+5. Token Issuer signs AAT with its private key
+6. AAT returned to agent
+
+#### 7.5.2 AAT Refresh
+
+AATs SHOULD be refreshed before expiry. The refresh flow:
+
+1. Agent presents current AAT and proof of possession (signed challenge)
+2. Token Issuer verifies current AAT is valid (not expired, not revoked)
+3. Token Issuer checks registry for revocation
+4. New AAT issued with same `session_id`, fresh `jti`, updated `exp`
+
+**Constraints**:
+- Refreshed AAT MUST preserve the `session_id`
+- Refreshed AAT MUST have a new `jti`
+- Refreshed AAT MAY have different `capabilities` (if policy changed)
+- Refresh MUST fail if the agent or session is revoked
+
+#### 7.5.3 AAT Validation
+
+The AIP Proxy MUST validate AATs using the following algorithm:
+
+```
+VALIDATE_AAT(aat):
+  # Step 1: Parse and verify JWT structure
+  IF NOT valid_jwt_structure(aat):
+    RETURN (INVALID, "malformed_aat")
+
+  # Step 2: Verify version
+  IF aat.aat_version != "aip/v1alpha3":
+    RETURN (INVALID, "unsupported_version")
+
+  # Step 3: Verify issuer
+  IF trusted_issuers IS CONFIGURED:
+    IF aat.iss NOT IN trusted_issuers:
+      RETURN (INVALID, "untrusted_issuer")
+
+  # Step 4: Verify signature
+  issuer_key = GET_ISSUER_PUBLIC_KEY(aat.iss, aat.header.kid)
+  IF issuer_key IS NULL:
+    RETURN (INVALID, "unknown_signing_key")
+  IF NOT verify_signature(aat, issuer_key):
+    RETURN (INVALID, "signature_invalid")
+
+  # Step 5: Check temporal validity
+  now = current_time()
+  IF now < aat.nbf - clock_skew:
+    RETURN (INVALID, "not_yet_valid")
+  IF now > aat.exp + clock_skew:
+    RETURN (INVALID, "aat_expired")
+
+  # Step 6: Check audience
+  IF aat.aud does not match expected_audience:
+    RETURN (INVALID, "audience_mismatch")
+
+  # Step 7: Check revocation (via registry)
+  IF registry.enabled:
+    revocation_status = CHECK_REGISTRY_REVOCATION(aat)
+    IF revocation_status == REVOKED:
+      RETURN (INVALID, "aat_revoked")
+
+  # Step 8: Verify agent identity
+  IF registry.enabled:
+    agent_record = GET_AGENT_FROM_REGISTRY(aat.agent.id)
+    IF agent_record IS NULL:
+      RETURN (INVALID, "unknown_agent")
+    IF agent_record.public_key_thumbprint != aat.agent.public_key_thumbprint:
+      RETURN (INVALID, "agent_key_mismatch")
+    IF agent_record.status != "active":
+      RETURN (INVALID, "agent_inactive")
+
+  # Step 9: Verify JTI uniqueness (replay prevention)
+  IF NOT ATOMIC_CHECK_AND_RECORD_JTI(aat.jti):
+    RETURN (INVALID, "replay_detected")
+
+  RETURN (VALID, nil)
+```
+
+### 7.6 AAT Transport
+
+#### 7.6.1 JSON-RPC (stdio) Transport
+
+For MCP connections over stdio, the AAT is included in the `tools/call` params as a reserved field:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "read_file",
+    "arguments": {"path": "/etc/hosts"},
+    "_aip_aat": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImFhdCtqd3QifQ..."
+  }
+}
+```
+
+The `_aip_aat` field:
+- MUST be stripped by the AIP Proxy before forwarding to the MCP server
+- MUST NOT be logged in audit trails (log `jti` instead)
+- Is OPTIONAL when `aat.require: false`
+
+#### 7.6.2 HTTP Transport
+
+For HTTP-based MCP connections, the AAT is sent as a header:
+
+```http
+POST /mcp HTTP/1.1
+X-AIP-AAT: eyJhbGciOiJFUzI1NiIsInR5cCI6ImFhdCtqd3QifQ...
+Content-Type: application/json
+
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "params": {
+    "name": "read_file",
+    "arguments": {"path": "/etc/hosts"}
+  }
+}
+```
+
+---
+
+## 8. AIP Registry (v1alpha3)
+
+The AIP Registry is the root of trust for agent identities.
+
+### 8.1 Overview
+
+The AIP Registry provides:
+1. **Agent registration**: Agents register their public keys and metadata
+2. **Key attestation**: Registry signs agent certificates (Agent Identity Documents)
+3. **Revocation**: Registry maintains lists of revoked agents, AATs, and sessions
+4. **Discovery**: Token Issuers and proxies look up agent identities
+
+### 8.2 Agent Identity Document (AID)
+
+The AID is a JSON document that defines an agent's cryptographic identity:
+
+```json
+{
+  "aid_version": "aip/v1alpha3",
+  "agent_id": "<globally-unique-identifier>",
+  "name": "<human-readable-name>",
+  "description": "<agent-description>",
+  "created_at": "<ISO-8601>",
+  "status": "active",
+
+  "public_key": {
+    "kty": "EC",
+    "crv": "P-256",
+    "x": "...",
+    "y": "...",
+    "kid": "<key-id>",
+    "use": "sig"
+  },
+
+  "metadata": {
+    "platform": "<agent-platform>",
+    "version": "<agent-version>",
+    "owner": "<owner-email-or-org>",
+    "tags": ["<tag>", ...]
+  },
+
+  "registry_attestation": {
+    "registry_id": "<registry-identifier>",
+    "signed_at": "<ISO-8601>",
+    "expires_at": "<ISO-8601>",
+    "signature": "<base64url-encoded-signature>"
+  }
+}
+```
+
+#### 8.2.1 AID Fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `aid_version` | string | Yes | MUST be `aip/v1alpha3` |
+| `agent_id` | string | Yes | Globally unique identifier (UUID v4 or URI) |
+| `name` | string | Yes | Human-readable name |
+| `description` | string | No | Agent description |
+| `created_at` | string | Yes | Registration time (ISO 8601) |
+| `status` | string | Yes | `active`, `suspended`, or `revoked` |
+| `public_key` | JWK | Yes | Agent's public key in JWK format (RFC 7517) |
+| `metadata` | object | No | Additional agent metadata |
+| `registry_attestation` | object | Yes | Registry's signature over the AID |
+
+#### 8.2.2 Agent Status
+
+| Status | Description | AAT Issuance | AAT Validation |
+|--------|-------------|--------------|----------------|
+| `active` | Agent is registered and operational | Allowed | Valid |
+| `suspended` | Temporarily disabled (e.g., security review) | Blocked | Rejected |
+| `revoked` | Permanently deactivated | Blocked | Rejected |
+
+#### 8.2.3 Registry Attestation
+
+The `registry_attestation` provides the registry's cryptographic endorsement of the AID:
+
+```
+ATTEST_AID(aid, registry_key):
+  aid_copy = COPY(aid)
+  REMOVE aid_copy.registry_attestation
+  canonical = JSON_CANONICALIZE(aid_copy)  # RFC 8785
+  signature = SIGN(registry_key, canonical)
+  RETURN {
+    "registry_id": registry.id,
+    "signed_at": now(),
+    "expires_at": now() + attestation_ttl,
+    "signature": base64url_encode(signature)
+  }
+```
+
+### 8.3 Registry API
+
+The AIP Registry exposes the following HTTP endpoints:
+
+#### 8.3.1 Agent Registration
+
+```http
+POST /v1/agents HTTP/1.1
+Host: registry.aip.example.com
+Content-Type: application/json
+Authorization: Bearer <registration-token>
+
+{
+  "name": "My AI Agent",
+  "description": "Development assistant for code review",
+  "public_key": {
+    "kty": "EC",
+    "crv": "P-256",
+    "x": "...",
+    "y": "..."
+  },
+  "metadata": {
+    "platform": "cursor",
+    "version": "1.0.0",
+    "owner": "dev@example.com"
+  }
+}
+```
+
+**Response**:
+```http
+HTTP/1.1 201 Created
+Content-Type: application/json
+
+{
+  "agent_id": "ag_550e8400-e29b-41d4-a716-446655440000",
+  "aid": { ... },
+  "registration_token_expires_at": "2026-03-19T00:00:00Z"
+}
+```
+
+#### 8.3.2 Agent Lookup
+
+```http
+GET /v1/agents/{agent_id} HTTP/1.1
+Host: registry.aip.example.com
+```
+
+**Response**:
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "agent_id": "ag_550e8400-e29b-41d4-a716-446655440000",
+  "status": "active",
+  "aid": { ... },
+  "public_key": { ... }
+}
+```
+
+#### 8.3.3 Revocation List
+
+```http
+GET /v1/revocations HTTP/1.1
+Host: registry.aip.example.com
+If-None-Match: "<etag>"
+```
+
+**Response**:
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+ETag: "<new-etag>"
+Cache-Control: max-age=30
+
+{
+  "version": 42,
+  "updated_at": "2026-02-19T10:30:00Z",
+  "revoked_agents": [
+    {
+      "agent_id": "ag_...",
+      "revoked_at": "2026-02-19T10:00:00Z",
+      "reason": "Security incident"
+    }
+  ],
+  "revoked_aats": [
+    {
+      "jti": "...",
+      "revoked_at": "2026-02-19T10:15:00Z",
+      "reason": "Token compromise"
+    }
+  ],
+  "revoked_sessions": [
+    {
+      "session_id": "...",
+      "revoked_at": "2026-02-19T10:20:00Z",
+      "reason": "User logout"
+    }
+  ]
+}
+```
+
+The revocation list supports conditional requests (ETag/If-None-Match) for efficient polling.
+
+#### 8.3.4 Agent Key Rotation
+
+```http
+POST /v1/agents/{agent_id}/rotate-key HTTP/1.1
+Host: registry.aip.example.com
+Content-Type: application/json
+Authorization: Bearer <agent-proof-of-possession>
+
+{
+  "new_public_key": {
+    "kty": "EC",
+    "crv": "P-256",
+    "x": "...",
+    "y": "..."
+  }
+}
+```
+
+Key rotation:
+1. Agent generates new key pair
+2. Agent signs rotation request with current private key (proof of possession)
+3. Registry verifies signature, updates stored public key
+4. Old key remains valid for `key_grace_period` (default: 1 hour)
+5. New AID attestation issued
+
+#### 8.3.5 Registry JWKS
+
+```http
+GET /v1/jwks HTTP/1.1
+Host: registry.aip.example.com
+```
+
+Returns the registry's public keys for verifying AID attestations:
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+Cache-Control: public, max-age=3600
+
+{
+  "keys": [
+    {
+      "kty": "EC",
+      "crv": "P-256",
+      "kid": "registry-key-2026-02",
+      "use": "sig",
+      "alg": "ES256",
+      "x": "...",
+      "y": "..."
+    }
+  ]
+}
+```
+
+### 8.4 Registry Security
+
+#### 8.4.1 Authentication
+
+All registry API calls (except JWKS and health) MUST be authenticated.
+
+| Endpoint | Required Auth | Description |
+|----------|---------------|-------------|
+| `POST /v1/agents` | Registration token | Initial agent registration |
+| `GET /v1/agents/{id}` | Bearer token or mTLS | Agent lookup |
+| `GET /v1/revocations` | Bearer token or mTLS | Revocation list |
+| `POST /v1/agents/{id}/rotate-key` | Proof of possession | Key rotation |
+| `GET /v1/jwks` | None (public) | Registry public keys |
+
+#### 8.4.2 Rate Limiting
+
+Implementations MUST rate-limit registration endpoints to prevent abuse.
+
+#### 8.4.3 Data Integrity
+
+The registry MUST:
+- Store agent public keys with integrity protection (e.g., signed records)
+- Maintain an append-only audit log of all registration events
+- Never expose private keys (the registry never holds agent private keys)
+
+---
+
+## 9. Token Issuer (v1alpha3)
+
+The Token Issuer validates agent identities and issues AATs.
+
+### 9.1 Overview
+
+The Token Issuer is a service that:
+1. Validates an agent's proof of possession (private key ownership)
+2. Verifies the agent is registered and active in the AIP Registry
+3. Binds the agent's AAT to the authorizing user
+4. Issues signed AATs with capabilities derived from policy
+
+### 9.2 Token Issuance Flow
+
+```
+┌─────────┐          ┌──────────────┐          ┌──────────────┐
+│  Agent   │          │ Token Issuer │          │ AIP Registry │
+└────┬─────┘          └──────┬───────┘          └──────┬───────┘
+     │                       │                         │
+     │ 1. Token Request      │                         │
+     │ (signed challenge)    │                         │
+     ├──────────────────────▶│                         │
+     │                       │ 2. Verify agent in      │
+     │                       │    registry              │
+     │                       ├────────────────────────▶│
+     │                       │                         │
+     │                       │ 3. Agent record +        │
+     │                       │    revocation status     │
+     │                       │◀────────────────────────┤
+     │                       │                         │
+     │                       │ 4. Verify proof of      │
+     │                       │    possession            │
+     │                       │                         │
+     │                       │ 5. Verify user           │
+     │                       │    authorization          │
+     │                       │                         │
+     │ 6. AAT                │                         │
+     │◀──────────────────────┤                         │
+     │                       │                         │
+```
+
+### 9.3 Token Request
+
+#### 9.3.1 Request Format
+
+```http
+POST /v1/token HTTP/1.1
+Host: issuer.aip.example.com
+Content-Type: application/json
+
+{
+  "grant_type": "agent_authentication",
+  "agent_id": "<agent-id>",
+  "proof": {
+    "type": "signed_challenge",
+    "challenge": "<server-provided-challenge>",
+    "signature": "<base64url-encoded-signature>",
+    "algorithm": "ES256"
+  },
+  "user_authorization": {
+    "type": "oauth2_token",
+    "token": "<user-oauth-access-token>"
+  },
+  "requested_capabilities": {
+    "tools": ["read_file", "list_directory", "git_status"],
+    "resource_scopes": ["repo:read"],
+    "allowed_servers": ["mcp://localhost:8080"]
+  },
+  "audience": "<target-proxy-or-server>"
+}
+```
+
+#### 9.3.2 Grant Types
+
+| Grant Type | Description | Use Case |
+|------------|-------------|----------|
+| `agent_authentication` | Agent proves identity + user authorization | Standard flow |
+| `aat_refresh` | Refresh existing AAT | Token renewal |
+| `agent_attestation` | Platform attestation (no user) | Autonomous agents |
+
+#### 9.3.3 Proof of Possession
+
+The agent proves ownership of its private key by signing a challenge:
+
+```
+GENERATE_PROOF(agent_key, challenge):
+  payload = {
+    "challenge": challenge,
+    "agent_id": agent.id,
+    "timestamp": now()
+  }
+  canonical = JSON_CANONICALIZE(payload)
+  signature = SIGN(agent_key.private, canonical)
+  RETURN {
+    "type": "signed_challenge",
+    "challenge": challenge,
+    "signature": base64url_encode(signature),
+    "algorithm": agent_key.algorithm
+  }
+```
+
+The Token Issuer:
+1. Retrieves the agent's public key from the AIP Registry
+2. Verifies the challenge signature using that public key
+3. Confirms the challenge was recently issued (prevents replay)
+
+#### 9.3.4 User Authorization Methods
+
+| Method | `user_authorization.type` | Description |
+|--------|--------------------------|-------------|
+| OAuth 2.0 | `oauth2_token` | User's OAuth access token (RECOMMENDED) |
+| OIDC ID Token | `oidc_id_token` | OpenID Connect ID token |
+| API Key | `api_key` | User's API key |
+| Local Attestation | `local_user` | OS-level user identity (localhost only) |
+
+**OAuth 2.0 flow** (RECOMMENDED):
+```json
+{
+  "user_authorization": {
+    "type": "oauth2_token",
+    "token": "ya29.A0ARrdaM..."
+  }
+}
+```
+
+The Token Issuer validates the OAuth token against the identity provider and extracts the `user_id` claim.
+
+**Local attestation** (development / localhost):
+```json
+{
+  "user_authorization": {
+    "type": "local_user",
+    "uid": 501,
+    "username": "developer",
+    "hostname": "dev-machine.local"
+  }
+}
+```
+
+### 9.4 Token Response
+
+#### 9.4.1 Success Response
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "aat": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImFhdCtqd3QiLCJraWQiOiJpc3N1ZXIta2V5LTIwMjYtMDIifQ...",
+  "token_type": "aat+jwt",
+  "expires_in": 3600,
+  "refresh_token": "<opaque-refresh-token>",
+  "capabilities_granted": {
+    "tools": ["read_file", "list_directory", "git_status"],
+    "resource_scopes": ["repo:read"]
+  },
+  "capabilities_denied": {
+    "tools": [],
+    "reason": "All requested capabilities granted"
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `aat` | string | The signed Agent Authentication Token (JWT) |
+| `token_type` | string | MUST be `aat+jwt` |
+| `expires_in` | int | Token lifetime in seconds |
+| `refresh_token` | string | Opaque token for AAT refresh (OPTIONAL) |
+| `capabilities_granted` | object | Capabilities included in the AAT |
+| `capabilities_denied` | object | Requested capabilities that were denied |
+
+#### 9.4.2 Error Response
+
+```http
+HTTP/1.1 400 Bad Request
+Content-Type: application/json
+
+{
+  "error": "<error-code>",
+  "error_description": "<human-readable>",
+  "error_details": { ... }
+}
+```
+
+| Error Code | HTTP Status | Description |
+|------------|-------------|-------------|
+| `invalid_request` | 400 | Malformed request |
+| `invalid_proof` | 401 | Proof of possession verification failed |
+| `agent_not_found` | 404 | Agent not registered in registry |
+| `agent_suspended` | 403 | Agent is suspended |
+| `agent_revoked` | 403 | Agent is revoked |
+| `user_auth_failed` | 401 | User authorization verification failed |
+| `capabilities_denied` | 403 | All requested capabilities denied |
+| `issuer_error` | 500 | Internal issuer error |
+
+### 9.5 Capability Determination
+
+The Token Issuer determines AAT capabilities based on:
+
+```
+DETERMINE_CAPABILITIES(requested, agent_record, user_permissions):
+  # Start with requested capabilities
+  granted = requested.tools
+
+  # Intersect with agent's registered permissions (from registry)
+  IF agent_record.allowed_tools IS NOT EMPTY:
+    granted = INTERSECTION(granted, agent_record.allowed_tools)
+
+  # Intersect with user's delegated permissions
+  IF user_permissions.delegatable_tools IS NOT EMPTY:
+    granted = INTERSECTION(granted, user_permissions.delegatable_tools)
+
+  RETURN granted
+```
+
+The AAT capabilities represent the **maximum** set of tools the agent can invoke. The AIP Proxy MAY further restrict this based on local policy.
+
+### 9.6 Token Issuer JWKS
+
+Token Issuers MUST expose a JWKS endpoint for AAT signature verification:
+
+```http
+GET /v1/jwks HTTP/1.1
+Host: issuer.aip.example.com
+```
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+Cache-Control: public, max-age=3600
+
+{
+  "keys": [
+    {
+      "kty": "EC",
+      "crv": "P-256",
+      "kid": "issuer-key-2026-02",
+      "use": "sig",
+      "alg": "ES256",
+      "x": "...",
+      "y": "..."
+    }
+  ]
+}
+```
+
+Proxies MUST cache JWKS responses and refresh when encountering unknown `kid` values.
+
+---
+
+## 10. User Binding and Delegation (v1alpha3)
+
+This section defines how agent actions are cryptographically linked to the authorizing user.
+
+### 10.1 Motivation
+
+Without user binding:
+- Agent actions are indistinguishable from each other and from human actions
+- Compliance frameworks (SOC 2, GDPR, HIPAA) cannot attribute actions to responsible parties
+- Revocation of user access does not revoke their agents' access
+
+User binding solves these by embedding a verifiable link from every agent action back to the authorizing human.
+
+### 10.2 Delegation Model
+
+```
+┌────────────┐     Grants Delegation     ┌────────────┐
+│    User     │─────────────────────────▶│   Agent    │
+│  (Human)    │                          │   (AI)     │
+│             │     AAT carries:          │            │
+│  user_id    │  - user_id               │  agent_id  │
+│  auth_time  │  - auth_method           │  public_key│
+│             │  - delegation_scope      │            │
+└────────────┘                           └─────┬──────┘
+                                               │
+                                        Uses AAT for
+                                        tool calls
+                                               │
+                                               ▼
+                                        ┌────────────┐
+                                        │ AIP Proxy  │
+                                        │            │
+                                        │ Verifies:  │
+                                        │ - agent_id │
+                                        │ - user_id  │
+                                        │ - scope    │
+                                        └────────────┘
+```
+
+### 10.3 Delegation Chain Verification
+
+The AIP Proxy MUST verify the complete delegation chain:
+
+```
+VERIFY_DELEGATION_CHAIN(aat):
+  # 1. Verify agent identity (AAT signature + registry check)
+  IF NOT valid_aat_signature(aat):
+    RETURN (INVALID, "signature_invalid")
+
+  # 2. Verify user binding is present
+  IF aat.user_binding IS EMPTY:
+    RETURN (INVALID, "missing_user_binding")
+
+  # 3. Verify user authentication freshness
+  max_auth_age = configured_max_auth_age OR 86400  # 24h default
+  IF now() - aat.user_binding.auth_time > max_auth_age:
+    RETURN (INVALID, "user_auth_stale")
+
+  # 4. Verify delegation scope covers the requested action
+  IF aat.user_binding.delegation_scope == "read_only":
+    IF requested_tool is write_operation:
+      RETURN (INVALID, "delegation_scope_exceeded")
+
+  RETURN (VALID, nil)
+```
+
+### 10.4 Audit Trail Integration
+
+When an AAT with user binding is present, audit log entries MUST include:
+
+```json
+{
+  "timestamp": "2026-02-19T10:30:45.123Z",
+  "direction": "upstream",
+  "method": "tools/call",
+  "tool": "write_file",
+  "decision": "ALLOW",
+  "policy_mode": "enforce",
+  "violation": false,
+
+  "agent_id": "ag_550e8400-e29b-41d4-a716-446655440000",
+  "agent_name": "Cursor IDE Agent",
+  "user_id": "user@example.com",
+  "user_auth_method": "oidc",
+  "delegation_scope": "tools",
+  "aat_jti": "aat_660e8400-e29b-41d4-a716-446655440001",
+  "aat_issuer": "https://issuer.aip.example.com",
+  "session_id": "550e8400-e29b-41d4-a716-446655440000",
+  "policy_hash": "a3c7f2e8d9b4f1e2c8a7d6f3e9b2c4f1..."
+}
+```
+
+This audit record establishes:
+- **Who** authorized the action (user_id, auth_method)
+- **What** agent performed the action (agent_id, agent_name)
+- **How** the delegation was granted (delegation_scope)
+- **When** it happened (timestamp)
+- **What** was done (tool, arguments)
+- **By whose authority** the AAT was issued (aat_issuer)
+
+### 10.5 User Binding Revocation
+
+When a user's authorization is revoked:
+1. Token Issuer marks all AATs for that user as revoked
+2. Registry propagates revocation to all proxies (via revocation list)
+3. Proxies reject tool calls from revoked AATs
+
+```
+REVOKE_USER_DELEGATION(user_id):
+  # Find all active AATs for this user
+  affected_aats = FIND_AATS_BY_USER(user_id)
+
+  FOR EACH aat IN affected_aats:
+    ADD_TO_REVOCATION_LIST(aat.jti, "user_delegation_revoked")
+
+  # Also revoke all sessions
+  affected_sessions = FIND_SESSIONS_BY_USER(user_id)
+  FOR EACH session IN affected_sessions:
+    ADD_TO_REVOCATION_LIST(session.session_id, "user_delegation_revoked")
+
+  LOG_REVOCATION_EVENT(user_id, affected_aats.count, affected_sessions.count)
+```
+
+---
+
+## 11. Error Codes
+
+AIP defines the following JSON-RPC error codes:
+
+| Code | Name | Description |
+|------|------|-------------|
+| -32001 | Forbidden | Tool not in allowed_tools list |
+| -32002 | Rate Limited | Rate limit exceeded |
+| -32004 | User Denied | User rejected approval prompt |
+| -32005 | User Timeout | Approval prompt timed out |
+| -32006 | Method Not Allowed | JSON-RPC method not permitted |
+| -32007 | Protected Path | Access to protected path blocked |
+| -32008 | Token Required | Identity token required but not provided |
+| -32009 | Token Invalid | Identity token validation failed |
+| -32010 | Policy Signature Invalid | Policy signature verification failed |
+| -32011 | Token Revoked | Token or session explicitly revoked |
+| -32012 | Audience Mismatch | Token audience does not match expected value |
+| -32013 | Schema Mismatch | Tool schema hash does not match policy |
+| -32014 | DLP Redaction Failed | Request redaction produced invalid content |
+| -32015 | AAT Required | Agent Authentication Token required but not provided *(new)* |
+| -32016 | AAT Invalid | AAT validation failed *(new)* |
+| -32017 | AAT Capability Denied | Requested tool not in AAT capabilities *(new)* |
+| -32018 | Agent Not Registered | Agent not found in AIP Registry *(new)* |
+| -32019 | Delegation Expired | User delegation has expired or been revoked *(new)* |
+| -32020 | Issuer Untrusted | AAT issuer not in trusted_issuers list *(new)* |
+
+### 11.1 Error Response Format
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "<request_id>",
+  "error": {
+    "code": "<error_code>",
+    "message": "<error_message>",
+    "data": {
+      "tool": "<tool_name>",
+      "reason": "<human_readable_reason>"
+    }
+  }
+}
+```
+
+### 11.2 New Error Codes (v1alpha3)
+
+#### -32015 AAT Required
+
+Returned when `aat.require: true` and no AAT is provided.
+
+```json
+{
+  "code": -32015,
+  "message": "AAT required",
+  "data": {
+    "tool": "write_file",
+    "reason": "Agent Authentication Token required for this proxy"
+  }
+}
+```
+
+#### -32016 AAT Invalid
+
+Returned when AAT validation fails.
+
+```json
+{
+  "code": -32016,
+  "message": "AAT invalid",
+  "data": {
+    "tool": "write_file",
+    "reason": "AAT signature verification failed",
+    "aat_error": "signature_invalid"
+  }
+}
+```
+
+Possible `aat_error` values:
+- `malformed_aat` - JWT structure invalid
+- `unsupported_version` - `aat_version` not recognized
+- `untrusted_issuer` - Issuer not in trusted list
+- `unknown_signing_key` - Issuer key not found
+- `signature_invalid` - Cryptographic signature failed
+- `not_yet_valid` - Token `nbf` is in the future
+- `aat_expired` - Token past expiration
+- `audience_mismatch` - Token audience wrong
+- `aat_revoked` - Token or session revoked
+- `unknown_agent` - Agent not in registry
+- `agent_key_mismatch` - Agent public key doesn't match
+- `agent_inactive` - Agent suspended or revoked
+- `replay_detected` - JTI reuse detected
+
+#### -32017 AAT Capability Denied
+
+Returned when the requested tool is not in the AAT's capabilities.
+
+```json
+{
+  "code": -32017,
+  "message": "AAT capability denied",
+  "data": {
+    "tool": "delete_database",
+    "reason": "Tool not in AAT capabilities",
+    "agent_id": "ag_550e8400...",
+    "granted_capabilities": ["read_file", "list_directory"]
+  }
+}
+```
+
+#### -32018 Agent Not Registered
+
+Returned when the agent in the AAT is not found in the registry.
+
+```json
+{
+  "code": -32018,
+  "message": "Agent not registered",
+  "data": {
+    "agent_id": "ag_unknown",
+    "reason": "Agent not found in AIP Registry"
+  }
+}
+```
+
+#### -32019 Delegation Expired
+
+Returned when the user binding in the AAT has expired.
+
+```json
+{
+  "code": -32019,
+  "message": "Delegation expired",
+  "data": {
+    "tool": "write_file",
+    "reason": "User delegation has expired",
+    "user_auth_time": "2026-02-18T10:00:00Z",
+    "max_auth_age": 86400
+  }
+}
+```
+
+#### -32020 Issuer Untrusted
+
+Returned when the AAT was issued by an issuer not in the `trusted_issuers` list.
+
+```json
+{
+  "code": -32020,
+  "message": "Issuer untrusted",
+  "data": {
+    "issuer": "https://unknown-issuer.example.com",
+    "reason": "AAT issuer not in trusted_issuers configuration"
+  }
+}
+```
+
+---
+
+## 12. Audit Log Format
+
+### 12.1 Required Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `timestamp` | ISO 8601 | Time of the decision |
+| `direction` | string | `upstream` (client->server) or `downstream` (server->client) |
+| `decision` | string | `ALLOW`, `BLOCK`, `ALLOW_MONITOR`, `RATE_LIMITED` |
+| `policy_mode` | string | `enforce` or `monitor` |
+| `violation` | boolean | Whether a policy violation was detected |
+
+### 12.2 Optional Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `method` | string | JSON-RPC method name |
+| `tool` | string | Tool name (for tools/call) |
+| `args` | object | Tool arguments (SHOULD be redacted) |
+| `failed_arg` | string | Argument that failed validation |
+| `failed_rule` | string | Regex pattern that failed |
+| `session_id` | string | Session identifier |
+| `token_id` | string | Identity token nonce |
+| `policy_hash` | string | Policy hash at decision time |
+| `agent_id` | string | Agent identifier (from AAT) *(new)* |
+| `agent_name` | string | Human-readable agent name (from AAT) *(new)* |
+| `user_id` | string | Authorizing user identifier (from AAT) *(new)* |
+| `user_auth_method` | string | User authentication method (from AAT) *(new)* |
+| `delegation_scope` | string | Delegation scope (from AAT) *(new)* |
+| `aat_jti` | string | AAT unique identifier *(new)* |
+| `aat_issuer` | string | Token Issuer identifier *(new)* |
+
+### 12.3 Example
+
+```json
+{
+  "timestamp": "2026-02-19T10:30:45.123Z",
+  "direction": "upstream",
+  "method": "tools/call",
+  "tool": "delete_file",
+  "args": {"path": "/etc/passwd"},
+  "decision": "BLOCK",
+  "policy_mode": "enforce",
+  "violation": true,
+  "failed_arg": "path",
+  "failed_rule": "^/home/.*",
+  "session_id": "550e8400-e29b-41d4-a716-446655440000",
+  "agent_id": "ag_550e8400-e29b-41d4-a716-446655440000",
+  "agent_name": "Cursor IDE Agent",
+  "user_id": "dev@example.com",
+  "user_auth_method": "oidc",
+  "delegation_scope": "tools",
+  "aat_jti": "aat_660e8400-e29b-41d4-a716-446655440001",
+  "aat_issuer": "https://issuer.aip.example.com",
+  "policy_hash": "a3c7f2e8d9b4f1e2c8a7d6f3e9b2c4f1a8e7d3c2b5f4e9a7c3d8f2b6e1a9c4f7"
+}
+```
+
+### 12.4 Identity Events
+
+*[Token issued/rotated/failed events remain unchanged from v1alpha2]*
+
+#### AAT Validated (v1alpha3)
+
+```json
+{
+  "timestamp": "2026-02-19T10:30:00.000Z",
+  "event": "AAT_VALIDATED",
+  "agent_id": "ag_550e8400...",
+  "user_id": "dev@example.com",
+  "aat_jti": "aat_660e8400...",
+  "issuer": "https://issuer.aip.example.com",
+  "capabilities_granted": ["read_file", "list_directory"]
+}
+```
+
+#### AAT Rejected (v1alpha3)
+
+```json
+{
+  "timestamp": "2026-02-19T10:30:00.000Z",
+  "event": "AAT_REJECTED",
+  "agent_id": "ag_550e8400...",
+  "aat_jti": "aat_660e8400...",
+  "error": "aat_expired",
+  "tool": "write_file"
+}
+```
+
+#### Registry Revocation Check (v1alpha3)
+
+```json
+{
+  "timestamp": "2026-02-19T10:30:00.000Z",
+  "event": "REGISTRY_REVOCATION_CHECK",
+  "mode": "cached",
+  "revocation_list_version": 42,
+  "agents_revoked": 3,
+  "aats_revoked": 1,
+  "sessions_revoked": 2
+}
+```
+
+---
+
+## 13. Conformance
+
+### 13.1 Conformance Levels
+
+| Level | Requirements |
+|-------|--------------|
+| **Basic** | Method authorization, tool allowlist, error codes |
+| **Full** | Basic + argument validation, rate limiting, DLP, audit logging |
+| **Extended** | Full + Human-in-the-Loop (action=ask) |
+| **Identity** | Full + Identity tokens, session management |
+| **Server** | Identity + Server-side validation endpoints |
+| **AAT** | Server + AAT validation, registry integration *(new)* |
+| **Federation** | AAT + Token Issuer, user binding, delegation chain *(new)* |
+
+### 13.2 Conformance Testing
+
+Implementations MUST pass the conformance test suite to claim AIP compliance.
+
+The test suite consists of:
+1. **Schema validation tests**: Verify policy parsing
+2. **Decision tests**: Input -> expected decision
+3. **Normalization tests**: Verify Unicode handling
+4. **Error format tests**: Verify JSON-RPC errors
+5. **Identity tests**: Token lifecycle, rotation, validation
+6. **Server tests**: HTTP endpoint behavior
+7. **AAT tests**: AAT structure, validation, capability checking *(new)*
+8. **Registry tests**: Agent lookup, revocation checking *(new)*
+9. **Delegation tests**: User binding verification, scope enforcement *(new)*
+
+See `spec/conformance/` for test vectors.
+
+### 13.3 Implementation Requirements
+
+Implementations MUST:
+- Parse `apiVersion: aip.io/v1alpha3` documents
+- Reject documents with unknown `apiVersion`
+- Apply NFKC normalization to names
+- Return specified error codes
+- Support `enforce` and `monitor` modes
+
+Implementations SHOULD:
+- Log decisions in the specified format
+- Support DLP scanning
+- Support rate limiting
+- Support identity tokens (for Identity conformance level)
+- Support AAT validation (for AAT conformance level)
+
+Implementations MAY:
+- Use any regex engine with RE2 semantics
+- Implement additional security features (egress control, sandboxing)
+- Implement server-side validation (for Server conformance level)
+- Implement a Token Issuer (for Federation conformance level)
+- Implement a Registry (for Federation conformance level)
+
+---
+
+## 14. Security Considerations
+
+### 14.0 Threat Model
+
+*[Section 14.0.1-14.0.3 remain unchanged from v1alpha2 with AAT additions]*
+
+#### 14.0.1 Trust Boundaries
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         UNTRUSTED                               │
+│  ┌──────────┐                                                   │
+│  │  Agent   │  AI agent may be manipulated via prompt injection │
+│  └────┬─────┘                                                   │
+│       │                                                         │
+├───────┼─────────────────────────────────────────────────────────┤
+│       │              TRUST BOUNDARY (AIP)                       │
+│       ▼                                                         │
+│  ┌──────────────┐                                               │
+│  │ AIP Policy   │  Policy engine is TRUSTED                     │
+│  │   Engine     │  Policy file integrity assumed                │
+│  └──────┬───────┘                                               │
+│         │                                                       │
+├─────────┼───────────────────────────────────────────────────────┤
+│         │              TRUST BOUNDARY (MCP)                     │
+│         ▼                                                       │
+│  ┌──────────────┐                                               │
+│  │  MCP Server  │  Server behavior is UNTRUSTED                 │
+│  │              │  Tool definitions may be malicious            │
+│  └──────────────┘                                               │
+│                          UNTRUSTED                              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+| Component | Trust Level | Rationale |
+|-----------|-------------|-----------|
+| **User** | Trusted | Defines policy, approves sensitive operations |
+| **Policy file** | Trusted | Integrity verified via signature |
+| **AIP Engine** | Trusted | Assumed correctly implemented |
+| **AIP Registry** | Trusted | Root of trust for agent identities *(new)* |
+| **Token Issuer** | Trusted | Issues AATs based on verified identity *(new)* |
+| **Agent (LLM)** | Untrusted | Subject to prompt injection, jailbreaks |
+| **Agent's AAT** | Conditionally Trusted | Trusted only after cryptographic verification *(new)* |
+| **MCP Server** | Untrusted | May be malicious or compromised |
+| **Tool definitions** | Untrusted | May contain poisoned descriptions |
+
+#### 14.0.2 Threats In Scope (v1alpha3 additions)
+
+| Threat | Attack Vector | AIP Mitigation |
+|--------|---------------|----------------|
+| **AAT theft** | Stolen AAT used by different agent | Agent key thumbprint verification, JTI replay prevention |
+| **AAT forgery** | Attacker creates fake AAT | Cryptographic signature verification via issuer JWKS |
+| **User impersonation** | Agent claims different user | User binding verified through Token Issuer's auth flow |
+| **Capability escalation** | Agent requests tools beyond delegation | Capability intersection with local policy |
+| **Registry poisoning** | Attacker modifies agent records | Registry attestation signatures, mTLS |
+| **Issuer compromise** | Attacker issues unauthorized AATs | Trusted issuer list, key rotation, revocation |
+| **Delegation abuse** | Agent acts beyond user's intent | Delegation scope enforcement, short-lived AATs |
+
+#### 14.0.3 Defense in Depth (v1alpha3)
+
+```
+Request Flow:
+
+  Agent Request (with AAT)
+       │
+       ▼
+  ┌────────────────┐
+  │ 1. Method      │  Block unauthorized JSON-RPC methods
+  │    Check       │
+  └───────┬────────┘
+          │
+          ▼
+  ┌────────────────┐
+  │ 2. AAT         │  Verify signature, issuer, expiry,
+  │    Validation  │  agent identity, user binding
+  │    (v1alpha3)  │  Check registry revocation list
+  └───────┬────────┘
+          │
+          ▼
+  ┌────────────────┐
+  │ 3. AAT         │  Check AAT capabilities against
+  │    Capability  │  requested tool
+  │    Check       │
+  └───────┬────────┘
+          │
+          ▼
+  ┌────────────────┐
+  │ 4. Identity    │  Validate session token, binding
+  │    Check       │
+  └───────┬────────┘
+          │
+          ▼
+  ┌────────────────┐
+  │ 5. Rate Limit  │  Prevent resource exhaustion
+  │    Check       │
+  └───────┬────────┘
+          │
+          ▼
+  ┌────────────────┐
+  │ 6. Tool        │  Allowlist enforcement
+  │    Check       │
+  └───────┬────────┘
+          │
+          ▼
+  ┌────────────────┐
+  │ 7. Argument    │  Regex validation, protected paths
+  │    Check       │
+  └───────┬────────┘
+          │
+          ▼
+  ┌────────────────┐
+  │ 8. HITL        │  Human approval for sensitive ops
+  │    (if ask)    │
+  └───────┬────────┘
+          │
+          ▼
+     MCP Server
+          │
+          ▼
+  ┌────────────────┐
+  │ 9. DLP         │  Redact sensitive response data
+  │    Scan        │
+  └───────┬────────┘
+          │
+          ▼
+     Agent Response
+```
+
+### 14.1 Policy File Protection
+
+The policy file itself MUST be protected from modification by the agent. Implementations MUST automatically add the policy file path to `protected_paths`.
+
+### 14.2 Regex Denial of Service (ReDoS)
+
+Implementations MUST use a regex engine that guarantees linear-time matching (RE2 or equivalent).
+
+### 14.3 Unicode Normalization
+
+Implementations MUST apply NFKC normalization to prevent homoglyph attacks.
+
+### 14.4 Monitor Mode Risks
+
+Monitor mode allows all requests through. Implementations SHOULD warn users when monitor mode is enabled in production environments.
+
+### 14.5 Audit Log Integrity
+
+Audit logs SHOULD be written to a location not writable by the agent.
+
+### 14.6 Identity Token Security
+
+*[Remains unchanged from v1alpha2]*
+
+### 14.7 Server Endpoint Security
+
+*[Remains unchanged from v1alpha2]*
+
+### 14.8 AAT Security (v1alpha3)
+
+#### 14.8.1 AAT Storage
+
+AATs SHOULD be stored in memory only, not persisted to disk. If persistence is required, AATs MUST be encrypted at rest.
+
+The `_aip_aat` field in JSON-RPC params MUST be stripped before any logging or forwarding.
+
+#### 14.8.2 AAT Transmission
+
+AATs transmitted over the network MUST use TLS 1.2 or later. Implementations MUST NOT send AATs over unencrypted connections.
+
+For HTTP transport, AATs MUST be sent as headers (not query parameters or request body) to prevent leakage in server logs.
+
+#### 14.8.3 AAT Lifetime
+
+AAT lifetimes SHOULD be limited:
+
+| Environment | Recommended `exp - iat` | Rationale |
+|-------------|------------------------|-----------|
+| Interactive (IDE) | 1 hour | Session-length |
+| Batch processing | Duration of job | Tight scoping |
+| Long-running service | 15 minutes (with refresh) | Minimize theft window |
+| CI/CD pipeline | Duration of pipeline | Job-scoped |
+
+Implementations SHOULD reject AATs with lifetime greater than 24 hours.
+
+#### 14.8.4 Replay Prevention
+
+AAT replay prevention uses the `jti` (JWT ID) claim:
+
+```
+ATOMIC_CHECK_AND_RECORD_JTI(jti):
+  # Same atomic semantics as nonce checking
+  IF ATOMIC_SET_IF_NOT_EXISTS(jti, ttl=max_token_age):
+    RETURN TRUE   # JTI was new
+  ELSE:
+    RETURN FALSE  # JTI already seen (replay attempt)
+```
+
+JTI storage requirements follow the same guidelines as nonce storage (Section 5 / v1alpha2).
+
+#### 14.8.5 Registry Trust
+
+The AIP Registry is a high-value target. Implementations MUST:
+- Use TLS for all registry communications
+- Verify the registry's TLS certificate
+- Support mTLS for registry authentication
+- Cache registry responses with bounded TTL
+- Have a fallback strategy when the registry is unreachable (see `failover_mode`)
+
+#### 14.8.6 Token Issuer Trust
+
+Token Issuers control what capabilities agents receive. Compromised issuers can grant excessive permissions. Mitigations:
+- Use `trusted_issuers` to limit accepted issuers
+- Intersect AAT capabilities with local policy (`capabilities_mode: "intersect"`)
+- Monitor `aip_aat_validations_total` for anomalies
+- Implement issuer key rotation and revocation
+
+---
+
+## 15. IANA Considerations
+
+This specification requests registration of the following:
+
+### 15.1 Media Type
+
+- Type name: application
+- Subtype name: vnd.aip.policy+yaml
+- Required parameters: None
+- File extension: .yaml, .yml
+
+### 15.2 URI Scheme
+
+This specification uses the `aip.io` namespace for versioning:
+- `aip.io/v1alpha1` - Initial specification
+- `aip.io/v1alpha2` - Identity and server-side validation
+- `aip.io/v1alpha3` - This specification (AAT, Registry, Token Issuer)
+
+### 15.3 JWT Type Header (v1alpha3)
+
+- `typ`: `aat+jwt` for Agent Authentication Tokens
+
+---
+
+## Appendix A: Complete Schema Reference
+
+```yaml
+# Complete AgentPolicy schema (v1alpha3)
+
+apiVersion: aip.io/v1alpha3      # REQUIRED
+kind: AgentPolicy                 # REQUIRED
+
+metadata:                         # REQUIRED
+  name: string                    # REQUIRED - Policy identifier
+  version: string                 # OPTIONAL - Semantic version
+  owner: string                   # OPTIONAL - Contact email
+  signature: string               # OPTIONAL - Policy signature
+
+spec:                             # REQUIRED
+  mode: enforce | monitor         # OPTIONAL, default: enforce
+
+  allowed_tools:                  # OPTIONAL
+    - string
+
+  allowed_methods:                # OPTIONAL
+    - string
+
+  denied_methods:                 # OPTIONAL
+    - string
+
+  protected_paths:                # OPTIONAL
+    - string
+
+  strict_args_default: boolean    # OPTIONAL, default: false
+
+  tool_rules:                     # OPTIONAL
+    - tool: string                # REQUIRED
+      action: allow|block|ask     # OPTIONAL, default: allow
+      rate_limit: string          # OPTIONAL, format: "N/period"
+      strict_args: boolean        # OPTIONAL
+      schema_hash: string         # OPTIONAL - Tool schema integrity
+      allow_args:                 # OPTIONAL
+        <arg_name>: <regex>
+
+  dlp:                            # OPTIONAL
+    enabled: boolean              # OPTIONAL, default: true
+    scan_requests: boolean        # OPTIONAL, default: false
+    scan_responses: boolean       # OPTIONAL, default: true
+    detect_encoding: boolean      # OPTIONAL, default: false
+    filter_stderr: boolean        # OPTIONAL, default: false
+    max_scan_size: string         # OPTIONAL, default: "1MB"
+    on_request_match: string      # OPTIONAL, default: "block"
+    on_redaction_failure: string  # OPTIONAL, default: "block"
+    log_original_on_failure: boolean  # OPTIONAL, default: false
+    patterns:                     # REQUIRED if dlp present
+      - name: string              # REQUIRED
+        regex: string             # REQUIRED
+        scope: string             # OPTIONAL, default: "all"
+
+  identity:                       # OPTIONAL
+    enabled: boolean              # OPTIONAL, default: false
+    token_ttl: string             # OPTIONAL, default: "5m"
+    rotation_interval: string     # OPTIONAL, default: "4m"
+    require_token: boolean        # OPTIONAL, default: false
+    session_binding: string       # OPTIONAL, default: "process"
+    nonce_window: string          # OPTIONAL, default: equals token_ttl
+    policy_transition_grace: string  # OPTIONAL, default: "0s"
+    audience: string              # OPTIONAL, default: metadata.name
+    nonce_storage:                # OPTIONAL
+      type: string                # memory | redis | postgres
+      address: string
+      key_prefix: string          # default: "aip:nonce:"
+      clock_skew_tolerance: string  # default: "30s"
+    keys:                         # OPTIONAL
+      signing_algorithm: string   # default: "ES256"
+      key_source: string          # generate | file | external
+      key_path: string
+      rotation_period: string     # default: "7d"
+      jwks_endpoint: string       # default: "/v1/jwks"
+
+  server:                         # OPTIONAL
+    enabled: boolean              # OPTIONAL, default: false
+    listen: string                # OPTIONAL, default: "127.0.0.1:9443"
+    failover_mode: string         # OPTIONAL, default: "fail_closed"
+    timeout: string               # OPTIONAL, default: "5s"
+    tls:
+      cert: string
+      key: string
+    fail_open_constraints:        # OPTIONAL
+      allowed_tools:
+        - string
+      max_duration: string
+      max_requests: integer
+      alert_webhook: string
+      require_local_policy: boolean
+    endpoints:                    # OPTIONAL
+      validate: string            # default: "/v1/validate"
+      revoke: string              # default: "/v1/revoke"
+      jwks: string                # default: "/v1/jwks"
+      health: string              # default: "/health"
+      metrics: string             # default: "/metrics"
+
+  registry:                       # OPTIONAL (v1alpha3)
+    enabled: boolean              # OPTIONAL, default: false
+    endpoint: string              # REQUIRED if enabled
+    tls:
+      ca_cert: string
+      client_cert: string
+      client_key: string
+    cache:
+      enabled: boolean            # default: true
+      ttl: string                 # default: "5m"
+      max_entries: integer        # default: 10000
+    revocation:
+      check_interval: string      # default: "30s"
+      mode: string                # online | cached | crl
+      crl_path: string
+    auth:
+      type: string                # bearer | mtls | api_key
+      token: string
+      api_key: string
+
+  aat:                            # OPTIONAL (v1alpha3)
+    enabled: boolean              # OPTIONAL, default: false
+    require: boolean              # OPTIONAL, default: false
+    validation:
+      verify_signature: boolean   # default: true
+      verify_user_binding: boolean  # default: true
+      verify_capabilities: boolean  # default: true
+      max_token_age: string       # default: "1h"
+      clock_skew: string          # default: "30s"
+    capabilities_mode: string     # intersect | aat_only | policy_only
+    trusted_issuers:              # OPTIONAL
+      - string
+    header_name: string           # default: "X-AIP-AAT"
+```
+
+---
+
+## Appendix B: Changelog
+
+### v1alpha3 (2026-02-19)
+
+**Agent Authentication Token (AAT)**
+- Added Section 7: Agent Authentication Token specification
+  - JWT-based AAT structure with agent, user_binding, capabilities, and context claims
+  - AAT signing requirements (ES256, EdDSA, RS256; no symmetric algorithms)
+  - AAT lifecycle: issuance, refresh, validation, revocation
+  - AAT transport via `_aip_aat` JSON-RPC param or `X-AIP-AAT` HTTP header
+  - AAT validation algorithm with 9-step verification
+  - JTI-based replay prevention
+- Added `aat` configuration section (Section 3.10)
+  - `capabilities_mode`: intersect, aat_only, policy_only
+  - `trusted_issuers` for issuer allowlisting
+  - Configurable validation strictness
+
+**AIP Registry**
+- Added Section 8: AIP Registry specification
+  - Agent Identity Document (AID) structure with registry attestation
+  - Registry API: registration, lookup, revocation list, key rotation, JWKS
+  - Agent status lifecycle: active, suspended, revoked
+  - Registry attestation via Ed25519/ES256 signatures
+- Added `registry` configuration section (Section 3.9)
+  - Revocation modes: online, cached, CRL
+  - Cache configuration for agent keys and revocation status
+  - mTLS and bearer token authentication
+
+**Token Issuer**
+- Added Section 9: Token Issuer specification
+  - Token issuance flow with proof of possession
+  - Grant types: agent_authentication, aat_refresh, agent_attestation
+  - User authorization methods: OAuth 2.0, OIDC, API key, local attestation
+  - Capability determination from agent record, user permissions, and requested capabilities
+  - Token Issuer JWKS endpoint
+
+**User Binding and Delegation**
+- Added Section 10: User Binding and Delegation specification
+  - Delegation model connecting users to agents to actions
+  - Delegation chain verification algorithm
+  - Delegation scope enforcement (full, tools, read_only, session, custom)
+  - User binding revocation propagation
+  - Audit trail integration with user identity
+
+**Evaluation Semantics**
+- Updated tool-level authorization (Section 4.3) with AAT capability checks
+  - Step 0b: AAT validation
+  - Step 0c: AAT capability intersection
+- Added AAT_REQUIRED, AAT_INVALID, AAT_CAPABILITY_DENIED decision outcomes
+
+**Error Codes**
+- Added -32015 AAT Required
+- Added -32016 AAT Invalid (with 13 detailed error subtypes)
+- Added -32017 AAT Capability Denied
+- Added -32018 Agent Not Registered
+- Added -32019 Delegation Expired
+- Added -32020 Issuer Untrusted
+
+**Metrics**
+- Added `aip_aat_validations_total` counter
+- Added `aip_registry_checks_total` counter
+- Added `aip_registry_latency_seconds` histogram
+- Added `aip_active_agents` gauge
+
+**Audit Logging**
+- Added AAT-enriched audit log fields (agent_id, agent_name, user_id, user_auth_method, delegation_scope, aat_jti, aat_issuer)
+- Added AAT_VALIDATED, AAT_REJECTED, REGISTRY_REVOCATION_CHECK event types
+
+**Security**
+- Updated threat model with AAT-specific threats (theft, forgery, impersonation, capability escalation, registry poisoning, issuer compromise, delegation abuse)
+- Added Section 14.8: AAT Security (storage, transmission, lifetime, replay prevention, registry trust, issuer trust)
+- Defense in depth expanded to 9 layers (added AAT validation, AAT capability check)
+
+**Conformance**
+- Added AAT conformance level
+- Added Federation conformance level
+- Added AAT, registry, and delegation test categories
+
+### v1alpha2 (2026-01-24)
+
+- Added identity configuration section (token generation, rotation, session binding)
+- Added server-side validation endpoints
+- Added `schema_hash` for tool poisoning prevention
+- Added DLP enhancements (scan_requests, max_scan_size, on_request_match)
+- Added threat model (Section 10.0)
+- Added policy signature (metadata.signature)
+- Added error codes -32008 through -32014
+- Added Identity and Server conformance levels
+
+### v1alpha1 (2026-01-20)
+
+- Initial draft specification
+- Defined core policy schema
+- Defined evaluation semantics
+- Defined error codes
+- Defined audit log format
+
+---
+
+## Appendix C: References
+
+- [Model Context Protocol (MCP)](https://modelcontextprotocol.io/)
+- [MCP Authorization (2025-06-18)](https://modelcontextprotocol.io/specification/2025-06-18/basic/authorization)
+- [JSON-RPC 2.0 Specification](https://www.jsonrpc.org/specification)
+- [RFC 2119 - Key words for use in RFCs](https://www.rfc-editor.org/rfc/rfc2119)
+- [RFC 6750 - The OAuth 2.0 Authorization Framework: Bearer Token Usage](https://www.rfc-editor.org/rfc/rfc6750)
+- [RFC 7517 - JSON Web Key (JWK)](https://www.rfc-editor.org/rfc/rfc7517)
+- [RFC 7519 - JSON Web Token (JWT)](https://www.rfc-editor.org/rfc/rfc7519)
+- [RFC 7638 - JSON Web Key (JWK) Thumbprint](https://www.rfc-editor.org/rfc/rfc7638)
+- [RFC 8707 - Resource Indicators for OAuth 2.0](https://www.rfc-editor.org/rfc/rfc8707)
+- [RFC 8785 - JSON Canonicalization Scheme (JCS)](https://www.rfc-editor.org/rfc/rfc8785)
+- [Unicode NFKC Normalization](https://unicode.org/reports/tr15/)
+- [RE2 Syntax](https://github.com/google/re2/wiki/Syntax)
+- [Agentic JWT (draft-goswami-agentic-jwt-00)](https://datatracker.ietf.org/doc/html/draft-goswami-agentic-jwt-00)
+
+---
+
+## Appendix D: Future Extensions
+
+This appendix describes features under consideration for future versions of AIP.
+
+### D.1 Network Egress Control
+
+**Status:** Proposed for v1beta1
+
+### D.2 Policy Inheritance
+
+**Status:** Under Discussion
+
+Allow policies to extend base policies:
+
+```yaml
+apiVersion: aip.io/v1beta1
+kind: AgentPolicy
+metadata:
+  name: team-policy
+spec:
+  extends: "org-base-policy"
+  allowed_tools:
+    - additional_tool
+```
+
+### D.3 External Identity Federation
+
+**Status:** Proposed for v1beta1
+
+Allow policies to integrate with external identity providers:
+
+```yaml
+spec:
+  identity:
+    federation:
+      type: oidc
+      issuer: "https://accounts.google.com"
+      client_id: "aip-agent"
+      required_claims:
+        email_verified: true
+        hd: "company.com"
+```
+
+Supported federation types:
+- `oidc` - OpenID Connect providers
+- `spiffe` - SPIFFE/SPIRE workload identity
+
+### D.4 Telemetry and Metrics
+
+**Status:** Partially implemented in v1alpha2/v1alpha3 (metrics endpoint)
+
+### D.5 Advanced Policy Expressions
+
+**Status:** Under Discussion
+
+Support for CEL (Common Expression Language) or Rego for complex validation:
+
+```yaml
+tool_rules:
+  - tool: file_write
+    action: allow
+    when: |
+      args.path.startsWith("/allowed/") &&
+      !args.path.contains("..") &&
+      size(args.content) < 1048576
+```
+
+### D.6 Agentic JWT Compatibility
+
+**Status:** Under Discussion for v1beta1
+
+Full compatibility with the Agentic JWT specification.
+
+Mapping to Agentic JWT claims:
+
+| AIP Field | Agentic JWT Claim |
+|-----------|-------------------|
+| `aat.agent.id` | `sub` (subject) |
+| `aat.context.policy_hash` | `agent_proof.agent_checksum` |
+| `aat.context.session_id` | `intent.workflow_id` |
+| `aat.capabilities.tools` | Workflow steps |
+| `aat.user_binding.user_id` | `azp` (authorized party) |
+
+### D.7 Multi-Agent Delegation (v1alpha3 future)
+
+**Status:** Under Discussion
+
+Support for agent-to-agent delegation chains, where Agent A (with user authorization) delegates a subset of capabilities to Agent B:
+
+```json
+{
+  "delegation_chain": [
+    {
+      "delegator": "user@example.com",
+      "delegatee": "ag_agent-a",
+      "scope": "tools"
+    },
+    {
+      "delegator": "ag_agent-a",
+      "delegatee": "ag_agent-b",
+      "scope": "read_only"
+    }
+  ]
+}
+```
+
+Constraints:
+- Each delegation step MUST reduce or maintain scope (never escalate)
+- Maximum chain depth: 3 (user -> agent -> sub-agent)
+- All delegators must be active and non-revoked
+
+### D.8 Registry Federation
+
+**Status:** Under Discussion
+
+Allow multiple registries to federate, enabling cross-organization agent identity verification:
+
+```yaml
+registry:
+  federation:
+    trusted_registries:
+      - id: "partner-registry"
+        endpoint: "https://registry.partner.com"
+        trust_level: "tools_only"  # Only trust tool capabilities
+```
+
+---
+
+## Appendix E: Implementation Notes
+
+### E.1 Reference Implementation
+
+The reference implementation is available at:
+https://github.com/openagentidentityprotocol/aip-go
+
+It provides:
+- Go-based proxy (`aip-proxy`)
+- Policy engine (`pkg/policy`)
+- DLP scanner (`pkg/dlp`)
+- Audit logger (`pkg/audit`)
+- Identity manager (`pkg/identity`)
+- HTTP server (`pkg/server`)
+- AAT validator (`pkg/aat`) *(v1alpha3)*
+- Registry client (`pkg/registry`) *(v1alpha3)*
+
+### E.2 Testing Against Conformance Suite
+
+```bash
+# Clone the spec repository
+git clone https://github.com/openagentidentityprotocol/agentidentityprotocol
+
+# Run conformance tests against your implementation
+cd agentidentityprotocol/spec/conformance
+./run-tests.sh --impl "your-aip-binary" --level "aat"
+```
+
+### E.3 AAT Implementation Guidance
+
+#### Generating Agent Key Pair
+
+```go
+import (
+    "crypto/ecdsa"
+    "crypto/elliptic"
+    "crypto/rand"
+)
+
+func generateAgentKeyPair() (*ecdsa.PrivateKey, error) {
+    return ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+}
+```
+
+#### Computing JWK Thumbprint (RFC 7638)
+
+```go
+import (
+    "crypto/sha256"
+    "encoding/json"
+)
+
+func jwkThumbprint(jwk map[string]interface{}) string {
+    // For EC keys: {"crv":"...","kty":"EC","x":"...","y":"..."}
+    required := map[string]interface{}{
+        "crv": jwk["crv"],
+        "kty": jwk["kty"],
+        "x":   jwk["x"],
+        "y":   jwk["y"],
+    }
+    canonical, _ := json.Marshal(required)
+    hash := sha256.Sum256(canonical)
+    return base64url(hash[:])
+}
+```
+
+#### Validating an AAT
+
+```go
+func validateAAT(tokenString string, trustedIssuers []string, registry RegistryClient) (*AATClaims, error) {
+    // 1. Parse JWT header (don't verify yet)
+    header, err := parseJWTHeader(tokenString)
+    if err != nil {
+        return nil, fmt.Errorf("malformed_aat: %w", err)
+    }
+
+    // 2. Get issuer's public key via JWKS
+    issuerKey, err := getIssuerKey(header.Kid, trustedIssuers)
+    if err != nil {
+        return nil, fmt.Errorf("unknown_signing_key: %w", err)
+    }
+
+    // 3. Verify signature
+    claims, err := jwt.ParseWithClaims(tokenString, &AATClaims{}, func(t *jwt.Token) (interface{}, error) {
+        return issuerKey, nil
+    })
+    if err != nil {
+        return nil, fmt.Errorf("signature_invalid: %w", err)
+    }
+
+    // 4. Check registry for agent status and revocation
+    agent, err := registry.GetAgent(claims.Agent.ID)
+    if err != nil {
+        return nil, fmt.Errorf("unknown_agent: %w", err)
+    }
+    if agent.Status != "active" {
+        return nil, fmt.Errorf("agent_inactive: %s", agent.Status)
+    }
+
+    // 5. Verify agent key thumbprint
+    if agent.PublicKeyThumbprint != claims.Agent.PublicKeyThumbprint {
+        return nil, fmt.Errorf("agent_key_mismatch")
+    }
+
+    // 6. Check JTI for replay
+    if !atomicRecordJTI(claims.JTI) {
+        return nil, fmt.Errorf("replay_detected")
+    }
+
+    return claims, nil
+}
+```
+
+### E.4 Registering Your Implementation
+
+Implementations that pass the conformance suite may be listed in the official registry. Submit a PR to the AIP repository with:
+- Implementation name and URL
+- Conformance level achieved (Basic/Full/Extended/Identity/Server/AAT/Federation)
+- Platform support matrix

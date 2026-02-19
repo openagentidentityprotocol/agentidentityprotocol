@@ -16,13 +16,23 @@
           {
             "group": "Getting started",
             "pages": [
-              "index"
+              "index",
+              "why-AIP"
             ]
           },
           {
             "group": "About AIP",
             "pages": [
-              "architecture"
+              "architecture",
+              "policy-reference",
+              {
+                "group": "Specifications",
+                "pages": [
+                  "specs/aip-v1alpha1",
+                  "specs/aip-v1alpha2"
+                ]
+              },
+              "faq"
             ]
           },
           {

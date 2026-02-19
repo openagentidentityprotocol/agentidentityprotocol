@@ -1,7 +1,7 @@
 {
   "$schema": "https://mintlify.com/docs.json",
   "theme": "aspen",
-  "name": "Open Agent Identity Protocol",
+  "name": "Agent Identity Protocol",
   "colors": {
     "primary": "#16A34A",
     "light": "#07C983",
@@ -20,13 +20,13 @@
             ]
           },
           {
-            "group": "About OAIP",
+            "group": "About AIP",
             "pages": [
               "architecture"
             ]
           },
           {
-            "group": "Developing with OAIP",
+            "group": "Developing with AIP",
             "pages": [
               "SDKs"
             ]

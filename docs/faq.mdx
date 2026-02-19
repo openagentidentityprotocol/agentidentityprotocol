@@ -24,39 +24,39 @@ Not for local development. Identity tokens are recommended when:
 3.  Set `failover_mode` (recommend `fail_closed` for security).
 4.  See the [Server-Side Validation Guide](../implementations/go-proxy/docs/server-guide.md) for details.
 
-### What is OAIP?
+### What is AIP?
 
-OAIP (Open Agent Identity Protocol) is an open standard for secure agentic identity management and authorization starting with a specification for policy-based authorization of AI agent tool calls. It defines how to declare, enforce, and audit what actions an AI agent can perform.
+AIP (Agent Identity Protocol) is an open standard for secure agentic identity management and authorization starting with a specification for policy-based authorization of AI agent tool calls. It defines how to declare, enforce, and audit what actions an AI agent can perform.
 
-### What's the difference between the OAIP specification and the Go proxy?
+### What's the difference between the AIP specification and the Go proxy?
 
-- **OAIP Specification** (`spec/`): The protocol standard that anyone can implement
+- **AIP Specification** (`spec/`): The protocol standard that anyone can implement
 - **Go Proxy** (`implementations/go-proxy/`): One reference implementation of that standard
 
 Think of it like HTTP (the spec) vs Apache/Nginx (implementations).
 
-### Can I use OAIP without the Go proxy?
+### Can I use AIP without the Go proxy?
 
-Yes! OAIP is a specification. You can:
-- Implement OAIP natively in your MCP client (Cursor, Claude Desktop, etc.)
+Yes! AIP is a specification. You can:
+- Implement AIP natively in your MCP client (Cursor, Claude Desktop, etc.)
 - Build your own proxy in any language
 - Use the Go proxy as a reference
 
-### Does OAIP require changes to my MCP server?
+### Does AIP require changes to my MCP server?
 
-No. OAIP sits between the MCP client and server as a transparent proxy. Your MCP server doesn't need any modifications.
+No. AIP sits between the MCP client and server as a transparent proxy. Your MCP server doesn't need any modifications.
 
 ```
-[Agent] → [OAIP Proxy] → [MCP Server]
+[Agent] → [AIP Proxy] → [MCP Server]
 ```
 
 The proxy intercepts `tools/call` requests, applies policy, and forwards allowed requests unchanged.
 
 ## Security
 
-### How is OAIP different from workforce AI governance tools like SurePath.ai?
+### How is AIP different from workforce AI governance tools like SurePath.ai?
 
-OAIP and workforce AI governance tools solve different problems at different layers:
+AIP and workforce AI governance tools solve different problems at different layers:
 
 **Workforce AI Governance (e.g., SurePath.ai)**:
 - Monitors *employee* AI usage across your organization
@@ -64,38 +64,38 @@ OAIP and workforce AI governance tools solve different problems at different lay
 - Answers: "Who in my org is using ChatGPT? What are they asking?"
 - Typically SaaS platforms for compliance and governance
 
-**OAIP (Open Agent Identity Protocol)**:
+**AIP (Agent Identity Protocol)**:
 - Controls *what actions AI agents can take* on your infrastructure
 - Tool-call level authorization (blocks dangerous operations)
 - Answers: "Can this agent delete files? Access production databases?"
 - Open protocol for developers building agents
 
-**These are complementary**: Use workforce governance to monitor employee AI usage. Use OAIP to secure the agents those employees build. Think of it as different layers—one monitors people, one protects infrastructure.
+**These are complementary**: Use workforce governance to monitor employee AI usage. Use AIP to secure the agents those employees build. Think of it as different layers—one monitors people, one protects infrastructure.
 
-### How is OAIP different from OAuth?
+### How is AIP different from OAuth?
 
-| Aspect | OAuth | OAIP |
+| Aspect | OAuth | AIP |
 |--------|-------|-----|
 | Granularity | Scope-level ("repo access") | Action-level ("repos.get with org:X") |
 | Timing | Grant-time | Runtime (every call) |
 | Audience | End users | Developers/Security teams |
 | Format | Token claims | YAML policy files |
 
-OAuth answers "who is this?" OAIP answers "should this specific action be allowed?"
+OAuth answers "who is this?" AIP answers "should this specific action be allowed?"
 
-### Can OAIP prevent all prompt injection attacks?
+### Can AIP prevent all prompt injection attacks?
 
-OAIP significantly reduces the blast radius of prompt injection by:
+AIP significantly reduces the blast radius of prompt injection by:
 - Limiting which tools an agent can call
 - Validating arguments with regex patterns
 - Requiring human approval for sensitive operations
 - Logging all decisions for forensic analysis
 
-However, OAIP cannot prevent prompt injection itself—it mitigates the *consequences*.
+However, AIP cannot prevent prompt injection itself—it mitigates the *consequences*.
 
 ### What about network egress? Can a malicious agent exfiltrate data?
 
-Network egress control is planned for OAIP v1beta1 (see [spec Appendix D](../spec/aip-v1alpha1.md#appendix-d-future-extensions)). Currently, tool-level authorization is enforced but the MCP server subprocess can still make network calls.
+Network egress control is planned for AIP v1beta1 (see [spec Appendix D](../spec/aip-v1alpha1.md#appendix-d-future-extensions)). Currently, tool-level authorization is enforced but the MCP server subprocess can still make network calls.
 
 For maximum security today, run MCP servers in containers with `--network=none`.
 
@@ -116,7 +116,7 @@ Pass the path with `--policy /path/to/policy.yaml`.
 
 ### What happens if a tool isn't in `allowed_tools`?
 
-It's blocked with error code `-32001 Forbidden`. OAIP is **default-deny**.
+It's blocked with error code `-32001 Forbidden`. AIP is **default-deny**.
 
 ### Can I test a policy without blocking anything?
 
@@ -154,7 +154,7 @@ tool_rules:
 
 ### My Docker container doesn't stop when I kill the proxy!
 
-When wrapping a Docker container with OAIP, signals (SIGTERM/SIGINT) are sent to the `docker` CLI process, not the container itself. This can leave zombie containers running.
+When wrapping a Docker container with AIP, signals (SIGTERM/SIGINT) are sent to the `docker` CLI process, not the container itself. This can leave zombie containers running.
 
 **Solution:** Always use `--rm` and `--init` flags:
 
@@ -174,15 +174,15 @@ aip --policy policy.yaml --target "docker run --rm --init -i myimage"
 
 For production deployments, consider running the AIP proxy *inside* the container or using a container orchestrator with proper lifecycle management.
 
-### What MCP clients work with OAIP?
+### What MCP clients work with AIP?
 
 Any MCP client that supports custom server commands:
 - **Cursor**: Add to `~/.cursor/mcp.json`
 - **Claude Desktop**: Add to `claude_desktop_config.json`
 - **Continue (VS Code)**: Add to Continue config
-- **Custom clients**: Use OAIP as the server command
+- **Custom clients**: Use AIP as the server command
 
-### Does OAIP work on Windows?
+### Does AIP work on Windows?
 
 The Go proxy builds for Windows. Human-in-the-loop (`action: ask`) uses native Windows dialogs via PowerShell.
 
@@ -218,5 +218,5 @@ Yes! We welcome implementations in other languages. Requirements:
 
 1. Open an issue describing the change
 2. Discuss with maintainers
-3. Submit a PR to `spec/oaip-v1alpha1.md`
+3. Submit a PR to `spec/AIP-v1alpha1.md`
 4. Include conformance tests for new behavior

@@ -2,25 +2,25 @@
 # https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
 
 # Default owner for everything
-* @ArangoGutierrez
+* @openagentidentityprotocol/OAIP-Collaborators  
 
 # Core proxy implementation
-/proxy/cmd/ @ArangoGutierrez
-/proxy/pkg/ @ArangoGutierrez
+/proxy/cmd/ @openagentidentityprotocol/OAIP-Collaborators
+/proxy/pkg/ @openagentidentityprotocol/OAIP-Collaborators
 
 # Policy engine (security-critical)
-/proxy/pkg/policy/ @ArangoGutierrez
+/proxy/pkg/policy/ @openagentidentityprotocol/OAIP-Collaborators
 
 # DLP scanner (security-critical)
-/proxy/pkg/dlp/ @ArangoGutierrez
+/proxy/pkg/dlp/ @openagentidentityprotocol/OAIP-Collaborators
 
 # Security documentation
-/SECURITY.md @ArangoGutierrez
-/.github/SECURITY/ @ArangoGutierrez
+/SECURITY.md @openagentidentityprotocol/OAIP-Collaborators
+/.github/SECURITY/ @openagentidentityprotocol/OAIP-Collaborators
 
 # CI/CD configuration
-/.github/workflows/ @ArangoGutierrez
+/.github/workflows/ @openagentidentityprotocol/OAIP-Collaborators
 
 # Documentation
-/docs/ @ArangoGutierrez
-/README.md @ArangoGutierrez
+/docs/ @openagentidentityprotocol/OAIP-Collaborators
+/README.md @openagentidentityprotocol/OAIP-Collaborators

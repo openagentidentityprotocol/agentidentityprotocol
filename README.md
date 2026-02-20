@@ -12,6 +12,8 @@
   <a href="https://news.ycombinator.com/item?id=46695323"><img src="https://img.shields.io/ycombinator/comments/46695323?label=Hacker%20News&style=flat-square" alt="Hacker News"></a>
 </p>
 
+> **Implementations:** [Go](https://github.com/openagentidentityprotocol/aip-go) 
+
 ---
 ## What is AIP?
 
@@ -339,6 +341,16 @@ We're building a **standard**, not just a tool.
 | [FAQ](docs/faq.md) | Common questions |
 
 ---
+
+## SDKs & Implementations
+
+| Language | Repository | Status |
+| --- | --- | --- |
+| **Go** | [aip-go](https://github.com/openagentidentityprotocol/aip-go) | ✅ Stable |
+| **Rust** | [aip-rust](https://github.com/openagentidentityprotocol/aip-rust) | 🚧 Coming Soon |
+
+Want to build an AIP implementation in another language? See [CONTRIBUTING.md](./CONTRIBUTING.md).
+
 
 ## Contributing
 

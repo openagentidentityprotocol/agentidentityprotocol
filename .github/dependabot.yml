@@ -4,31 +4,6 @@
 version: 2
 
 updates:
-  # Go modules (proxy)
-  - package-ecosystem: "gomod"
-    directory: "/proxy"
-    schedule:
-      interval: "weekly"
-      day: "monday"
-      time: "09:00"
-      timezone: "America/Los_Angeles"
-    open-pull-requests-limit: 10
-    commit-message:
-      prefix: "deps(go)"
-    labels:
-      - "dependencies"
-      - "go"
-    reviewers:
-      - "ArangoGutierrez"
-    groups:
-      # Group minor and patch updates together
-      go-minor-patch:
-        patterns:
-          - "*"
-        update-types:
-          - "minor"
-          - "patch"
-
   # GitHub Actions
   - package-ecosystem: "github-actions"
     directory: "/"
@@ -45,6 +20,7 @@ updates:
       - "github-actions"
     reviewers:
       - "ArangoGutierrez"
+      - "yungcero"
     groups:
       actions-all:
         patterns:

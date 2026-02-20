@@ -1,0 +1,2924 @@
+---
+title: "AIP v1alpha2"
+---
+
+# Agent Identity Protocol (AIP) Specification
+
+**Version:** v1alpha2  
+**Status:** Draft  
+**Last Updated:** 2026-01-24  
+**Authors:** Eduardo Arango (arangogutierrez@gmail.com)
+
+---
+
+## Abstract
+
+The Agent Identity Protocol (AIP) defines a standard for policy-based authorization of AI agent tool calls. AIP enables runtime environments to enforce fine-grained access control over Model Context Protocol (MCP) tool invocations, providing a security boundary between AI agents and external resources.
+
+This specification defines:
+1. The policy document schema (`AgentPolicy`)
+2. Evaluation semantics for authorization decisions
+3. **Agent identity and session management** *(new in v1alpha2)*
+4. **Server-side validation endpoints** *(new in v1alpha2)*
+5. Error codes for denied requests
+6. Audit log format for compliance
+
+AIP is designed to be implementation-agnostic. Any MCP-compatible runtime (Cursor, Claude Desktop, VS Code, custom implementations) can implement this specification.
+
+---
+
+## Table of Contents
+
+1. [Introduction](#1-introduction)
+2. [Terminology](#2-terminology)
+3. [Policy Document Schema](#3-policy-document-schema)
+4. [Evaluation Semantics](#4-evaluation-semantics)
+5. [Agent Identity](#5-agent-identity) *(new in v1alpha2)*
+6. [Server-Side Validation](#6-server-side-validation) *(new in v1alpha2)*
+7. [Error Codes](#7-error-codes)
+8. [Audit Log Format](#8-audit-log-format)
+9. [Conformance](#9-conformance)
+10. [Security Considerations](#10-security-considerations)
+11. [IANA Considerations](#11-iana-considerations)
+
+**Appendices**
+- [Appendix A: Complete Schema Reference](#appendix-a-complete-schema-reference)
+- [Appendix B: Changelog](#appendix-b-changelog)
+- [Appendix C: References](#appendix-c-references)
+- [Appendix D: Future Extensions](#appendix-d-future-extensions)
+- [Appendix E: Implementation Notes](#appendix-e-implementation-notes)
+
+---
+
+## 1. Introduction
+
+### 1.1 Motivation
+
+AI agents operating through the Model Context Protocol (MCP) have access to powerful tools: file systems, databases, APIs, and cloud infrastructure. Without a policy layer, agents operate with unrestricted access to any tool the MCP server exposes.
+
+AIP addresses this gap by introducing:
+- **Capability declaration**: Explicit allowlists of permitted tools
+- **Argument validation**: Regex-based constraints on tool parameters
+- **Human-in-the-loop**: Interactive approval for sensitive operations
+- **Audit trail**: Immutable logging of all authorization decisions
+- **Agent identity**: Cryptographic binding of policies to agent sessions *(new in v1alpha2)*
+- **Server-side validation**: Optional HTTP endpoints for distributed policy enforcement *(new in v1alpha2)*
+
+### 1.2 Goals
+
+1. **Interoperability**: Any MCP runtime can implement AIP
+2. **Simplicity**: YAML-based policies readable by security teams
+3. **Defense in depth**: Multiple layers (method, tool, argument, identity)
+4. **Fail-closed**: Unknown tools are denied by default
+5. **Zero-trust ready**: Support for token-based identity verification *(new in v1alpha2)*
+
+### 1.3 Non-Goals
+
+The following are explicitly out of scope for **this version** of the specification:
+- Network egress control (see [Appendix D: Future Extensions](#appendix-d-future-extensions))
+- Subprocess sandboxing (implementation-defined)
+- External identity federation (OIDC/SPIFFE - see [Appendix D](#d3-external-identity-federation))
+- Rate limiting algorithms (implementation-defined)
+- Policy expression languages beyond regex (CEL/Rego - see [Appendix D](#d5-advanced-policy-expressions))
+
+### 1.4 Relationship to MCP
+
+AIP is designed as a security layer for MCP. It intercepts `tools/call` requests and applies policy checks before forwarding to the MCP server.
+
+```
+┌─────────┐     ┌─────────────┐     ┌─────────────┐
+│  Agent  │────▶│ AIP Policy  │────▶│ MCP Server  │
+│         │◀────│   Engine    │◀────│             │
+└─────────┘     └─────────────┘     └─────────────┘
+                      │
+                      ▼
+              ┌─────────────┐
+              │ AIP Server  │  (optional, v1alpha2)
+              │  Endpoint   │
+              └─────────────┘
+```
+
+### 1.5 Relationship to MCP Authorization
+
+MCP defines an optional OAuth 2.1-based authorization layer (MCP 2025-06-18 and later). AIP is **complementary** to MCP authorization:
+
+| Concern | MCP Authorization | AIP |
+|---------|-------------------|-----|
+| **Scope** | Transport-level authentication | Tool-level authorization |
+| **What it protects** | Access to MCP server | Access to specific tools |
+| **Token type** | OAuth 2.1 access tokens | AIP Identity Tokens (optional) |
+| **Policy language** | OAuth scopes | YAML policy documents |
+
+Implementations MAY use both MCP authorization (for server access) and AIP (for tool access) simultaneously.
+
+---
+
+## 2. Terminology
+
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119).
+
+| Term | Definition |
+|------|------------|
+| **Agent** | An AI system that invokes MCP tools on behalf of a user |
+| **Policy** | A document specifying authorization rules (AgentPolicy) |
+| **Tool** | An MCP tool exposed by an MCP server |
+| **Decision** | The result of policy evaluation: ALLOW, BLOCK, or ASK |
+| **Violation** | A policy rule was triggered (may or may not block) |
+| **Session** | A bounded period of agent activity with consistent identity *(new)* |
+| **Identity Token** | A cryptographic token binding policy to session *(new)* |
+| **Policy Hash** | SHA-256 hash of the canonical policy document *(new)* |
+
+---
+
+## 3. Policy Document Schema
+
+### 3.1 Document Structure
+
+An AIP policy document is a YAML file with the following top-level structure:
+
+```yaml
+apiVersion: aip.io/v1alpha2
+kind: AgentPolicy
+metadata:
+  name: <string>
+  version: <string>           # OPTIONAL
+  owner: <string>             # OPTIONAL
+  signature: <string>         # OPTIONAL (v1alpha2)
+spec:
+  mode: <string>              # OPTIONAL, default: "enforce"
+  allowed_tools: [<string>]   # OPTIONAL
+  allowed_methods: [<string>] # OPTIONAL
+  denied_methods: [<string>]  # OPTIONAL
+  tool_rules: [<ToolRule>]    # OPTIONAL
+  protected_paths: [<string>] # OPTIONAL
+  strict_args_default: <bool> # OPTIONAL, default: false
+  dlp: <DLPConfig>            # OPTIONAL
+  identity: <IdentityConfig>  # OPTIONAL (v1alpha2)
+  server: <ServerConfig>      # OPTIONAL (v1alpha2)
+```
+
+### 3.2 Required Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `apiVersion` | string | MUST be `aip.io/v1alpha2` |
+| `kind` | string | MUST be `AgentPolicy` |
+| `metadata.name` | string | Unique identifier for this policy |
+
+### 3.3 Metadata
+
+```yaml
+metadata:
+  name: <string>        # REQUIRED - Policy identifier
+  version: <string>     # OPTIONAL - Semantic version (e.g., "1.0.0")
+  owner: <string>       # OPTIONAL - Contact email
+  signature: <string>   # OPTIONAL - Policy signature (v1alpha2)
+```
+
+#### 3.3.1 Policy Signature (v1alpha2)
+
+The `signature` field provides cryptographic integrity verification for the policy document.
+
+Format: `<algorithm>:<base64-encoded-signature>`
+
+Supported algorithms:
+- `ed25519` - Ed25519 signature (RECOMMENDED)
+
+Example:
+```yaml
+metadata:
+  name: production-agent
+  signature: "ed25519:YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXo..."
+```
+
+When present, implementations MUST verify the signature before applying the policy. Signature verification failure MUST result in policy rejection.
+
+The signature is computed over the **canonical form** of the policy document (see Section 5.2.1).
+
+### 3.4 Spec Fields
+
+*[Sections 3.4.1 through 3.6 remain unchanged from v1alpha1]*
+
+#### 3.4.1 mode
+
+Controls enforcement behavior.
+
+| Value | Behavior |
+|-------|----------|
+| `enforce` | Violations are blocked (default) |
+| `monitor` | Violations are logged but allowed |
+
+Implementations MUST support both modes.
+
+#### 3.4.2 allowed_tools
+
+A list of tool names that the agent MAY invoke.
+
+```yaml
+allowed_tools:
+  - github_get_repo
+  - read_file
+  - list_directory
+```
+
+Tool names are subject to normalization (see Section 4.1).
+
+#### 3.4.3 allowed_methods
+
+A list of JSON-RPC methods that are permitted. If not specified, implementations MUST use the default safe list:
+
+```yaml
+# Default allowed methods (when not specified)
+allowed_methods:
+  - initialize
+  - initialized
+  - ping
+  - tools/call
+  - tools/list
+  - completion/complete
+  - notifications/initialized
+  - notifications/progress
+  - notifications/message
+  - notifications/resources/updated
+  - notifications/resources/list_changed
+  - notifications/tools/list_changed
+  - notifications/prompts/list_changed
+  - cancelled
+```
+
+The wildcard `*` MAY be used to allow all methods.
+
+#### 3.4.4 denied_methods
+
+A list of JSON-RPC methods that are explicitly denied. Denied methods take precedence over allowed methods.
+
+```yaml
+denied_methods:
+  - resources/read
+  - resources/write
+```
+
+#### 3.4.5 protected_paths
+
+A list of file paths that tools MUST NOT access. Any tool argument containing a protected path MUST be blocked.
+
+```yaml
+protected_paths:
+  - ~/.ssh
+  - ~/.aws/credentials
+  - .env
+```
+
+Implementations MUST:
+- Expand `~` to the user's home directory
+- Automatically protect the policy file itself
+
+#### 3.4.6 strict_args_default
+
+When `true`, tool rules reject any arguments not explicitly declared in `allow_args`.
+
+Default: `false`
+
+### 3.5 Tool Rules
+
+Tool rules provide fine-grained control over specific tools.
+
+```yaml
+tool_rules:
+  - tool: <string>              # REQUIRED - Tool name
+    action: <string>            # OPTIONAL - allow|block|ask (default: allow)
+    rate_limit: <string>        # OPTIONAL - e.g., "10/minute"
+    strict_args: <bool>         # OPTIONAL - Override strict_args_default
+    schema_hash: <string>       # OPTIONAL - Tool schema integrity (v1alpha2)
+    allow_args:                 # OPTIONAL
+      <arg_name>: <regex>
+```
+
+#### 3.5.1 Actions
+
+| Action | Behavior |
+|--------|----------|
+| `allow` | Permit (subject to argument validation) |
+| `block` | Deny unconditionally |
+| `ask` | Require interactive user approval |
+
+#### 3.5.2 Rate Limiting
+
+Format: `<count>/<period>`
+
+| Period | Aliases |
+|--------|---------|
+| `second` | `sec`, `s` |
+| `minute` | `min`, `m` |
+| `hour` | `hr`, `h` |
+
+Example: `"10/minute"`, `"100/hour"`, `"5/second"`
+
+Rate limiting algorithm is implementation-defined (token bucket, sliding window, etc.).
+
+#### 3.5.3 Argument Validation
+
+The `allow_args` field maps argument names to regex patterns.
+
+```yaml
+allow_args:
+  url: "^https://github\\.com/.*"
+  query: "^SELECT\\s+.*"
+```
+
+Implementations MUST:
+- Use a regex engine with linear-time guarantees (RE2 or equivalent)
+- Match against the string representation of the argument value
+- Treat missing constrained arguments as a violation
+
+#### 3.5.4 Tool Schema Hashing (v1alpha2)
+
+The `schema_hash` field provides cryptographic verification of tool definitions to prevent tool poisoning attacks.
+
+**Format**: `<algorithm>:<hex-digest>`
+
+**Supported algorithms**:
+- `sha256` (RECOMMENDED)
+- `sha384`
+- `sha512`
+
+**Example**:
+```yaml
+tool_rules:
+  - tool: read_file
+    action: allow
+    schema_hash: "sha256:a3c7f2e8d9b4f1e2c8a7d6f3e9b2c4f1a8e7d3c2b5f4e9a7c3d8f2b6e1a9c4f7"
+    allow_args:
+      path: "^/home/.*"
+```
+
+**Hash computation**:
+
+The schema hash is computed over the canonical form of the tool's MCP schema:
+
+```
+TOOL_SCHEMA_HASH(tool):
+  schema = {
+    "name": tool.name,
+    "description": tool.description,
+    "inputSchema": tool.inputSchema  # JSON Schema for arguments
+  }
+  canonical = JSON_CANONICALIZE(schema)  # RFC 8785
+  hash = SHA256(canonical)
+  RETURN "sha256:" + hex_encode(hash)
+```
+
+**Behavior**:
+
+| Condition | Behavior |
+|-----------|----------|
+| `schema_hash` absent | No schema verification (backward compatible) |
+| Hash matches | Tool allowed (proceed to argument validation) |
+| Hash mismatch | Tool BLOCKED with error -32013 |
+| Tool not found | Tool BLOCKED with error -32001 |
+
+**Use cases**:
+
+1. **Tool poisoning prevention**: Detect when an MCP server changes a tool's behavior after policy approval
+2. **Compliance auditing**: Prove that approved tools haven't been modified
+3. **Supply chain security**: Pin specific tool versions in policy
+
+**Generating schema hashes**:
+
+```bash
+# Using the AIP CLI (reference implementation)
+aip-proxy schema-hash --server mcp://localhost:8080 --tool read_file
+# Output: sha256:a3c7f2e8...
+
+# Or from tools/list response
+aip-proxy schema-hash --tools-file tools.json --tool read_file
+```
+
+**Operational considerations**:
+
+- Schema hashes MUST be regenerated when MCP server is updated
+- Implementations SHOULD log hash mismatches with both expected and actual hashes
+- Policy authors SHOULD document which tool version the hash corresponds to
+
+**Error code** (new):
+
+| Code | Name | Description |
+|------|------|-------------|
+| -32013 | Schema Mismatch | Tool schema hash does not match policy *(new)* |
+
+### 3.6 DLP Configuration
+
+Data Loss Prevention (DLP) scans for sensitive data in requests and responses.
+
+```yaml
+dlp:
+  enabled: <bool>             # OPTIONAL, default: true when dlp block present
+  scan_requests: <bool>       # OPTIONAL, default: false (v1alpha2)
+  scan_responses: <bool>      # OPTIONAL, default: true
+  detect_encoding: <bool>     # OPTIONAL, default: false
+  filter_stderr: <bool>       # OPTIONAL, default: false
+  max_scan_size: <string>     # OPTIONAL, default: "1MB" (v1alpha2)
+  on_request_match: <string>  # OPTIONAL, default: "block" (v1alpha2)
+  patterns:
+    - name: <string>          # REQUIRED - Rule identifier
+      regex: <string>         # REQUIRED - Detection pattern
+      scope: <string>         # OPTIONAL, default: "all" (request|response|all)
+```
+
+#### 3.6.1 scan_requests (v1alpha2)
+
+When `true`, DLP patterns are applied to tool arguments before the request is forwarded.
+
+Default: `false` (backward compatible)
+
+**Use case**: Prevents data exfiltration via arguments (e.g., embedding secrets in API queries).
+
+#### 3.6.2 scan_responses
+
+When `true`, DLP patterns are applied to tool responses.
+
+Default: `true`
+
+#### 3.6.3 max_scan_size (v1alpha2)
+
+Maximum size of content to scan per request/response.
+
+Format: Size string (e.g., `"1MB"`, `"512KB"`, `"10MB"`)
+
+Default: `"1MB"`
+
+Content exceeding this limit:
+- SHOULD be truncated for scanning (scan first `max_scan_size` bytes)
+- MUST log a warning
+
+**Purpose**: Prevents ReDoS and memory exhaustion on large payloads.
+
+#### 3.6.4 on_request_match (v1alpha2)
+
+Action when DLP pattern matches in a request (when `scan_requests: true`).
+
+| Value | Behavior |
+|-------|----------|
+| `block` | Reject the request with error -32001 (default) |
+| `redact` | Replace matched content and forward |
+| `warn` | Log warning and forward unchanged |
+
+Default: `block`
+
+**Security note**: `redact` for requests may produce invalid tool arguments. Use with caution.
+
+**Redaction failure handling (v1alpha2)**:
+
+When `on_request_match: "redact"` is configured, redacted content may cause downstream failures:
+
+1. **Invalid JSON**: Redaction in nested structures may break JSON parsing
+2. **Schema validation failure**: Redacted values may violate tool argument schemas
+3. **Tool execution failure**: The MCP server may reject redacted arguments
+
+**Configuration for redaction failure behavior**:
+
+```yaml
+dlp:
+  scan_requests: true
+  on_request_match: "redact"
+  on_redaction_failure: <string>    # OPTIONAL, default: "block" (v1alpha2)
+  log_original_on_failure: <bool>   # OPTIONAL, default: false (v1alpha2)
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `on_redaction_failure` | string | Action when redacted request fails: `block`, `allow_original`, `reject` |
+| `log_original_on_failure` | bool | Log pre-redaction content for forensics (sensitive!) |
+
+**on_redaction_failure values**:
+
+| Value | Behavior | Security | Use Case |
+|-------|----------|----------|----------|
+| `block` | Block with -32001 (default) | High | Production |
+| `allow_original` | Forward original unredacted | Low | Debug only |
+| `reject` | Block with -32014 (new error) | High | Strict compliance |
+
+**Example configuration**:
+```yaml
+dlp:
+  scan_requests: true
+  on_request_match: "redact"
+  on_redaction_failure: "block"
+  log_original_on_failure: true  # For forensic analysis
+  patterns:
+    - name: "API Key"
+      regex: "sk-[a-zA-Z0-9]{32}"
+      scope: "request"
+```
+
+**Error code for redaction failures** (new):
+
+| Code | Name | Description |
+|------|------|-------------|
+| -32014 | DLP Redaction Failed | Request redaction produced invalid content *(new)* |
+
+**Example error response**:
+```json
+{
+  "code": -32014,
+  "message": "DLP redaction failed",
+  "data": {
+    "tool": "http_request",
+    "reason": "Redacted request failed argument validation",
+    "dlp_rule": "API Key",
+    "validation_error": "url: expected string, got [REDACTED:API Key]"
+  }
+}
+```
+
+**Audit logging for redaction events**:
+
+```json
+{
+  "timestamp": "2026-01-24T10:30:45.123Z",
+  "event": "DLP_REQUEST_REDACTION",
+  "tool": "http_request",
+  "dlp_rule": "API Key",
+  "redaction_count": 1,
+  "forwarded": false,
+  "failure_reason": "argument_validation_failed"
+}
+```
+
+⚠️ **Security consideration**: Setting `log_original_on_failure: true` will log sensitive data that DLP attempted to redact. This SHOULD only be enabled:
+- In development environments
+- With appropriate log access controls
+- For time-limited forensic investigations
+
+#### 3.6.5 Pattern Scope (v1alpha2)
+
+Patterns can be scoped to requests, responses, or both:
+
+```yaml
+patterns:
+  - name: "AWS Key"
+    regex: "AKIA[0-9A-Z]{16}"
+    scope: "all"           # Scan both requests and responses
+  
+  - name: "SQL Injection"
+    regex: "(?i)(DROP|DELETE|TRUNCATE)\\s+TABLE"
+    scope: "request"       # Only scan requests (detect exfiltration attempts)
+  
+  - name: "SSN"
+    regex: "\\d{3}-\\d{2}-\\d{4}"
+    scope: "response"      # Only scan responses (PII protection)
+```
+
+When a pattern matches, the matched content MUST be replaced with:
+```
+[REDACTED:<name>]
+```
+
+### 3.7 Identity Configuration (v1alpha2)
+
+The `identity` section configures agent identity and token management.
+
+```yaml
+spec:
+  identity:
+    enabled: <bool>           # OPTIONAL, default: false
+    token_ttl: <duration>     # OPTIONAL, default: "5m"
+    rotation_interval: <duration>  # OPTIONAL, default: "4m"
+    require_token: <bool>     # OPTIONAL, default: false
+    session_binding: <string> # OPTIONAL, default: "process"
+    nonce_window: <duration>  # OPTIONAL, default: equals token_ttl (v1alpha2)
+    policy_transition_grace: <duration>  # OPTIONAL, default: "0s" (v1alpha2)
+    audience: <string>        # OPTIONAL, default: policy metadata.name (v1alpha2)
+    nonce_storage: <NonceStorageConfig>  # OPTIONAL (v1alpha2)
+    keys: <KeyConfig>         # OPTIONAL (v1alpha2)
+```
+
+#### 3.7.1 enabled
+
+When `true`, the AIP engine generates and manages identity tokens for the session.
+
+Default: `false`
+
+#### 3.7.2 token_ttl
+
+The time-to-live for identity tokens.
+
+Format: Go duration string (e.g., `"5m"`, `"1h"`, `"300s"`)
+
+Default: `"5m"` (5 minutes)
+
+Implementations SHOULD use short TTLs (5-15 minutes) to limit token theft window.
+
+#### 3.7.3 rotation_interval
+
+How often to rotate tokens before expiry.
+
+Format: Go duration string
+
+Default: `"4m"` (4 minutes, ensuring rotation before 5m TTL)
+
+**Constraint**: `rotation_interval` MUST be less than `token_ttl`.
+
+**Validation behavior (v1alpha2)**:
+
+When loading a policy, implementations MUST validate the rotation_interval constraint:
+
+```
+VALIDATE_ROTATION_INTERVAL(config):
+  IF config.rotation_interval >= config.token_ttl:
+    RETURN ERROR("rotation_interval must be less than token_ttl")
+  
+  # Recommended: rotation should leave grace period for in-flight requests
+  IF config.rotation_interval > (config.token_ttl * 0.9):
+    LOG_WARNING("rotation_interval very close to token_ttl; consider reducing")
+  
+  RETURN OK
+```
+
+**Error handling**:
+
+| Condition | Behavior | Error |
+|-----------|----------|-------|
+| `rotation_interval >= token_ttl` | Reject policy | Policy load failure |
+| `rotation_interval > token_ttl * 0.9` | Warn, allow | Log warning |
+| `rotation_interval` not specified | Use default (`"4m"`) | - |
+| `rotation_interval: "0s"` | Disable rotation | - |
+
+**Invalid configuration example**:
+```yaml
+# INVALID: rotation_interval >= token_ttl
+identity:
+  enabled: true
+  token_ttl: "5m"
+  rotation_interval: "6m"  # ERROR: must be < 5m
+```
+
+**Policy load error response**:
+```json
+{
+  "error": "policy_validation_failed",
+  "message": "rotation_interval (6m) must be less than token_ttl (5m)",
+  "field": "spec.identity.rotation_interval"
+}
+```
+
+**Recommended configurations**:
+
+| Use Case | `token_ttl` | `rotation_interval` | Rationale |
+|----------|-------------|---------------------|-----------|
+| Default | `"5m"` | `"4m"` | 1 minute grace for in-flight |
+| High-security | `"5m"` | `"2m"` | More frequent rotation |
+| Low-latency | `"1m"` | `"45s"` | Minimal token lifetime |
+| Long-lived | `"1h"` | `"50m"` | 10 minute grace |
+
+**Disabling rotation**:
+
+Setting `rotation_interval: "0s"` disables automatic rotation. Tokens will only be refreshed when explicitly requested or when they expire.
+
+```yaml
+identity:
+  enabled: true
+  token_ttl: "5m"
+  rotation_interval: "0s"  # No automatic rotation
+```
+
+⚠️ **Not recommended** for production as it increases token theft window.
+
+#### 3.7.4 require_token
+
+When `true`, all tool calls MUST include a valid identity token. Calls without tokens are rejected with error code -32008.
+
+Default: `false`
+
+This enables gradual rollout: start with `require_token: false` to generate tokens without enforcement, then enable enforcement.
+
+#### 3.7.5 session_binding
+
+Determines what context is bound to the session identity.
+
+| Value | Binding |
+|-------|---------|
+| `process` | Session bound to process ID (default) |
+| `policy` | Session bound to policy hash |
+| `strict` | Session bound to process + policy + timestamp |
+
+#### 3.7.6 nonce_window
+
+The duration to retain nonces for replay detection.
+
+Format: Go duration string
+
+Default: Equals `token_ttl` (e.g., `"5m"` if token_ttl is `"5m"`)
+
+**Purpose**: Bounds the storage required for replay prevention. Nonces older than `nonce_window` MAY be pruned from storage.
+
+**Constraints**:
+- `nonce_window` MUST be greater than or equal to `token_ttl`
+- Setting `nonce_window` less than `token_ttl` is a configuration error
+
+**Storage considerations**:
+
+| Deployment | Recommended `nonce_window` |
+|------------|---------------------------|
+| Single instance | `token_ttl` (default) |
+| Multi-instance (shared storage) | `token_ttl + clock_skew_tolerance` |
+| High-security | `2 * token_ttl` |
+
+Example:
+```yaml
+identity:
+  enabled: true
+  token_ttl: "5m"
+  nonce_window: "10m"  # Retain nonces for 2x TTL
+```
+
+#### 3.7.7 policy_transition_grace
+
+The grace period during which tokens issued with the previous policy hash remain valid after a policy update.
+
+Format: Go duration string
+
+Default: `"0s"` (no grace period - strict policy enforcement)
+
+**Purpose**: Allows gradual policy rollouts without invalidating all in-flight tokens immediately.
+
+**Behavior**:
+1. When policy is updated, the previous policy hash is retained in `recent_policy_hashes`
+2. Tokens with either current or recent policy hash are accepted during the grace period
+3. After grace period expires, only current policy hash is valid
+
+**Constraints**:
+- `policy_transition_grace` SHOULD be less than `token_ttl` to ensure policy changes take effect within one token lifetime
+- Setting very long grace periods weakens security guarantees
+
+**Example**:
+```yaml
+identity:
+  enabled: true
+  token_ttl: "5m"
+  policy_transition_grace: "2m"  # Accept old policy hash for 2 minutes
+```
+
+**Use cases**:
+
+| Scenario | Recommended Setting |
+|----------|---------------------|
+| Development | `"0s"` - Immediate policy updates |
+| Production (single instance) | `"30s"` - Brief grace for in-flight requests |
+| Production (distributed) | `"2m"` - Allow for propagation delay |
+| Canary deployments | Equal to deployment window |
+
+#### 3.7.8 audience (v1alpha2)
+
+The intended audience for identity tokens. This value is included in the token's `aud` claim and MUST be validated by recipients.
+
+Format: URI string identifying the MCP server or service
+
+Default: Value of `metadata.name`
+
+**Purpose**: Prevents tokens issued for one MCP server from being accepted by another. This is critical for:
+- Multi-tenant deployments where agents access multiple MCP servers
+- Defense against token theft and replay across services
+- Compliance with OAuth 2.1 audience binding requirements (RFC 8707)
+
+**Example**:
+```yaml
+identity:
+  enabled: true
+  audience: "https://mcp.example.com/api"
+```
+
+**Validation requirements**:
+- Implementations MUST reject tokens where `aud` does not match the expected audience
+- When `server.enabled: true`, the audience SHOULD be the server's canonical URL
+- Wildcards are NOT permitted in audience values
+
+**Constraints**:
+- `audience` MUST be a valid URI or the policy `metadata.name`
+- Empty string is NOT valid; use default (metadata.name) instead
+
+#### 3.7.9 nonce_storage (v1alpha2)
+
+Configuration for distributed nonce storage, required for multi-instance deployments.
+
+```yaml
+spec:
+  identity:
+    nonce_storage:
+      type: <string>              # OPTIONAL, default: "memory"
+      address: <string>           # REQUIRED if type != "memory"
+      key_prefix: <string>        # OPTIONAL, default: "aip:nonce:"
+      clock_skew_tolerance: <duration>  # OPTIONAL, default: "30s"
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `type` | string | Storage backend: `memory`, `redis`, `postgres` |
+| `address` | string | Connection string for external storage |
+| `key_prefix` | string | Prefix for nonce keys (namespacing) |
+| `clock_skew_tolerance` | duration | Added to TTL to handle clock drift |
+
+**Storage type requirements**:
+
+| Type | Atomicity | Persistence | Multi-instance | Use Case |
+|------|-----------|-------------|----------------|----------|
+| `memory` | ✅ (sync.Map) | ❌ | ❌ | Development, single-instance |
+| `redis` | ✅ (SET NX) | ✅ | ✅ | Production (RECOMMENDED) |
+| `postgres` | ✅ (UNIQUE) | ✅ | ✅ | Production with existing DB |
+
+**Example configurations**:
+
+```yaml
+# Single instance (default)
+identity:
+  enabled: true
+  nonce_storage:
+    type: "memory"
+
+# Redis cluster
+identity:
+  enabled: true
+  nonce_storage:
+    type: "redis"
+    address: "redis://redis-cluster:6379"
+    key_prefix: "prod:aip:nonce:"
+    clock_skew_tolerance: "30s"
+
+# PostgreSQL
+identity:
+  enabled: true
+  nonce_storage:
+    type: "postgres"
+    address: "postgres://user:pass@db:5432/aip?sslmode=require"
+    key_prefix: "nonces_"
+```
+
+⚠️ **Multi-instance deployments**: Using `type: "memory"` with multiple AIP instances is a **security vulnerability** that allows cross-instance replay attacks. Implementations SHOULD warn when `memory` storage is detected in environments with multiple instances.
+
+### 3.8 Server Configuration (v1alpha2)
+
+The `server` section configures optional HTTP endpoints for server-side validation.
+
+```yaml
+spec:
+  server:
+    enabled: <bool>           # OPTIONAL, default: false
+    listen: <string>          # OPTIONAL, default: "127.0.0.1:9443"
+    failover_mode: <string>   # OPTIONAL, default: "fail_closed" (v1alpha2)
+    timeout: <duration>       # OPTIONAL, default: "5s" (v1alpha2)
+    tls:                      # OPTIONAL
+      cert: <string>          # Path to TLS certificate
+      key: <string>           # Path to TLS private key
+    endpoints:                # OPTIONAL
+      validate: <string>      # Validation endpoint path (default: "/v1/validate")
+      revoke: <string>        # Revocation endpoint path (default: "/v1/revoke")
+      health: <string>        # Health check path (default: "/health")
+      metrics: <string>       # Metrics endpoint path (default: "/metrics")
+```
+
+#### 3.8.1 enabled
+
+When `true`, the AIP engine starts an HTTP server for remote validation.
+
+Default: `false`
+
+#### 3.8.2 listen
+
+The address and port to bind the HTTP server.
+
+Format: `<host>:<port>` or `:<port>`
+
+Default: `"127.0.0.1:9443"` (localhost only)
+
+⚠️ **Security**: Binding to `0.0.0.0` exposes the validation endpoint to the network. Implementations MUST require TLS when listen address is not localhost.
+
+#### 3.8.3 failover_mode
+
+Defines behavior when the validation server is unreachable (for clients) or when internal validation fails (for server).
+
+| Value | Behavior | Security | Availability |
+|-------|----------|----------|--------------|
+| `fail_closed` | Deny all requests | High | Low |
+| `fail_open` | Allow all requests | Low | High |
+| `local_policy` | Fall back to local policy evaluation | Medium | Medium |
+
+Default: `fail_closed` (deny-by-default for security)
+
+**fail_closed** (RECOMMENDED for production):
+```yaml
+server:
+  failover_mode: "fail_closed"
+```
+- All validation requests are denied when server is unreachable
+- Returns error code -32001 (Forbidden) with reason "validation_unavailable"
+- Highest security, may cause availability issues
+
+**fail_open** (NOT RECOMMENDED):
+```yaml
+server:
+  failover_mode: "fail_open"
+```
+- All requests are allowed when server is unreachable
+- Logs warning: "failover_mode=fail_open triggered"
+- ⚠️ Only use in development or when availability > security
+
+**fail_open constraints (v1alpha2)**:
+
+When `failover_mode: "fail_open"` is configured, implementations SHOULD require additional constraints to limit exposure:
+
+```yaml
+server:
+  failover_mode: "fail_open"
+  fail_open_constraints:             # RECOMMENDED when fail_open
+    allowed_tools: [<string>]        # Only these tools fail-open
+    max_duration: <duration>         # Auto-revert to fail_closed
+    max_requests: <int>              # Max requests before fail_closed
+    alert_webhook: <string>          # Notify on fail_open activation
+    require_local_policy: <bool>     # Must have valid local policy
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `allowed_tools` | []string | Only these tools are allowed during fail_open (others blocked) |
+| `max_duration` | duration | Auto-revert to fail_closed after this period |
+| `max_requests` | int | Auto-revert after N requests in fail_open mode |
+| `alert_webhook` | string | POST notification when fail_open activates |
+| `require_local_policy` | bool | Only fail_open if local policy is loaded and valid |
+
+**Example with constraints**:
+```yaml
+server:
+  failover_mode: "fail_open"
+  fail_open_constraints:
+    allowed_tools:
+      - read_file
+      - list_directory
+    max_duration: "5m"
+    max_requests: 100
+    alert_webhook: "https://alerts.example.com/aip-failover"
+    require_local_policy: true
+```
+
+**Behavior**:
+- When validation server becomes unreachable:
+  1. Increment fail_open counter
+  2. Check if `max_requests` exceeded → revert to fail_closed
+  3. Check if `max_duration` exceeded → revert to fail_closed
+  4. If request tool NOT in `allowed_tools` → block with -32001
+  5. If `require_local_policy` and no valid local policy → block with -32001
+  6. POST to `alert_webhook` (async, fire-and-forget)
+  7. Allow request, log warning
+
+**Implementation requirements**:
+- Implementations SHOULD warn at policy load time if `fail_open` is used without constraints
+- Implementations MUST log every request processed in fail_open mode
+- Implementations SHOULD expose a metric `aip_fail_open_requests_total`
+
+**local_policy** (RECOMMENDED for hybrid deployments):
+```yaml
+server:
+  failover_mode: "local_policy"
+```
+- Falls back to local policy file evaluation
+- Requires local policy to be loaded and valid
+- Provides security with graceful degradation
+
+#### 3.8.4 timeout
+
+Maximum time to wait for validation server response.
+
+Format: Go duration string
+
+Default: `"5s"` (5 seconds)
+
+After timeout, the `failover_mode` behavior is triggered.
+
+Example:
+```yaml
+server:
+  enabled: true
+  timeout: "3s"           # Shorter timeout for latency-sensitive apps
+  failover_mode: "local_policy"
+```
+
+#### 3.8.5 TLS Configuration
+
+When the listen address is not localhost (`127.0.0.1` or `::1`), TLS MUST be configured.
+
+```yaml
+tls:
+  cert: "/path/to/cert.pem"
+  key: "/path/to/key.pem"
+```
+
+Implementations SHOULD support:
+- PEM-encoded certificates and keys
+- Let's Encrypt/ACME integration (implementation-defined)
+
+#### 3.8.6 Endpoints
+
+Customizable endpoint paths:
+
+| Endpoint | Default | Description |
+|----------|---------|-------------|
+| `validate` | `/v1/validate` | Policy validation endpoint |
+| `revoke` | `/v1/revoke` | Token/session revocation (v1alpha2) |
+| `jwks` | `/v1/jwks` | JSON Web Key Set for token verification (v1alpha2) |
+| `health` | `/health` | Health check (for load balancers) |
+| `metrics` | `/metrics` | Prometheus metrics (optional) |
+
+---
+
+## 4. Evaluation Semantics
+
+*[Sections 4.1 through 4.5 remain unchanged from v1alpha1]*
+
+### 4.1 Name Normalization
+
+Tool names and method names MUST be normalized before comparison using the following algorithm:
+
+```
+NORMALIZE(input):
+  1. Apply NFKC Unicode normalization
+  2. Convert to lowercase
+  3. Trim leading/trailing whitespace
+  4. Remove non-printable and control characters
+  5. Return result
+```
+
+This prevents bypass attacks using:
+- Fullwidth characters: `ｄｅｌｅｔｅ` → `delete`
+- Ligatures: `ﬁle` → `file`
+- Zero-width characters: `dele​te` → `delete`
+
+### 4.2 Method-Level Authorization
+
+Method authorization is the FIRST line of defense, evaluated BEFORE tool-level checks.
+
+```
+IS_METHOD_ALLOWED(method):
+  normalized = NORMALIZE(method)
+  
+  IF normalized IN denied_methods:
+    RETURN DENY
+  
+  IF "*" IN allowed_methods:
+    RETURN ALLOW
+  
+  IF normalized IN allowed_methods:
+    RETURN ALLOW
+  
+  RETURN DENY
+```
+
+### 4.3 Tool-Level Authorization
+
+Tool authorization applies to `tools/call` requests.
+
+```
+IS_TOOL_ALLOWED(tool_name, arguments, token):
+  normalized = NORMALIZE(tool_name)
+  
+  # Step 0: Verify identity token (v1alpha2)
+  IF identity.require_token:
+    IF token IS EMPTY OR NOT valid_token(token):
+      RETURN TOKEN_REQUIRED
+  
+  # Step 1: Check rate limiting
+  IF rate_limiter_exceeded(normalized):
+    RETURN RATE_LIMITED
+  
+  # Step 2: Check protected paths
+  IF arguments_contain_protected_path(arguments):
+    RETURN PROTECTED_PATH
+  
+  # Step 3: Check tool rules
+  rule = find_rule(normalized)
+  IF rule EXISTS:
+    IF rule.action == "block":
+      RETURN BLOCK
+    IF rule.action == "ask":
+      IF validate_arguments(rule, arguments):
+        RETURN ASK
+      ELSE:
+        RETURN BLOCK
+    # action == "allow" falls through
+  
+  # Step 4: Check allowed_tools list
+  IF normalized NOT IN allowed_tools:
+    RETURN BLOCK
+  
+  # Step 5: Validate arguments (if rule exists)
+  IF rule EXISTS AND rule.allow_args NOT EMPTY:
+    IF NOT validate_arguments(rule, arguments):
+      RETURN BLOCK
+  
+  # Step 6: Strict args check
+  IF strict_args_enabled(rule):
+    IF arguments has undeclared keys:
+      RETURN BLOCK
+  
+  RETURN ALLOW
+```
+
+### 4.4 Decision Outcomes
+
+| Decision | Mode=enforce | Mode=monitor |
+|----------|--------------|--------------|
+| ALLOW | Forward request | Forward request |
+| BLOCK | Return error | Forward request, log violation |
+| ASK | Prompt user | Prompt user |
+| RATE_LIMITED | Return error | Return error (always enforced) |
+| PROTECTED_PATH | Return error | Return error (always enforced) |
+| TOKEN_REQUIRED | Return error | Return error (always enforced) *(new)* |
+| TOKEN_INVALID | Return error | Return error (always enforced) *(new)* |
+
+### 4.5 Argument Validation
+
+```
+VALIDATE_ARGUMENTS(rule, arguments):
+  FOR EACH (arg_name, pattern) IN rule.allow_args:
+    IF arg_name NOT IN arguments:
+      RETURN FALSE  # Required argument missing
+    
+    value = STRING(arguments[arg_name])
+    IF NOT REGEX_MATCH(pattern, value):
+      RETURN FALSE
+  
+  RETURN TRUE
+```
+
+The `STRING()` function converts values to string representation:
+- String → as-is
+- Number → decimal representation
+- Boolean → "true" or "false"
+- Null → empty string
+- Array/Object → JSON serialization
+
+---
+
+## 5. Agent Identity (v1alpha2)
+
+This section defines the agent identity model introduced in v1alpha2.
+
+### 5.1 Overview
+
+Agent identity provides:
+1. **Session binding**: Cryptographic proof that requests belong to the same session
+2. **Policy integrity**: Verification that the policy hasn't changed mid-session
+3. **Replay prevention**: Nonces prevent token reuse across sessions
+4. **Audit correlation**: Session IDs link related audit events
+
+### 5.2 Policy Hash
+
+The policy hash uniquely identifies a policy configuration.
+
+#### 5.2.1 Canonical Form
+
+Before hashing, the policy MUST be converted to canonical form:
+
+```
+CANONICALIZE(policy):
+  1. Remove metadata.signature field (if present)
+  2. Serialize to JSON using RFC 8785 (JSON Canonicalization Scheme)
+  3. Return UTF-8 encoded bytes
+```
+
+#### 5.2.2 Hash Computation
+
+```
+POLICY_HASH(policy):
+  canonical = CANONICALIZE(policy)
+  hash = SHA-256(canonical)
+  RETURN hex_encode(hash)
+```
+
+The policy hash is a 64-character lowercase hexadecimal string.
+
+### 5.3 Identity Token Structure
+
+An AIP Identity Token is a JWT-like structure (but NOT necessarily JWT-encoded) with the following fields:
+
+```json
+{
+  "version": "aip/v1alpha2",
+  "aud": "<audience-uri>",
+  "policy_hash": "<64-char-hex>",
+  "session_id": "<uuid>",
+  "agent_id": "<policy-metadata-name>",
+  "issued_at": "<ISO-8601>",
+  "expires_at": "<ISO-8601>",
+  "nonce": "<random-hex>",
+  "binding": {
+    "process_id": <int>,
+    "policy_path": "<string>",
+    "hostname": "<string>"
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `version` | string | Token format version (`aip/v1alpha2`) |
+| `aud` | string | Intended audience (from `identity.audience` or `metadata.name`) |
+| `policy_hash` | string | SHA-256 hash of canonical policy |
+| `session_id` | string | UUID identifying this session |
+| `agent_id` | string | Value of `metadata.name` from policy |
+| `issued_at` | string | Token issuance time (ISO 8601) |
+| `expires_at` | string | Token expiration time (ISO 8601) |
+| `nonce` | string | Random value for replay prevention |
+| `binding` | object | Session binding context (see 5.3.2) |
+
+#### 5.3.2 Binding Object (v1alpha2)
+
+The `binding` object ties tokens to their execution context:
+
+```json
+{
+  "binding": {
+    "process_id": 12345,
+    "policy_path": "/etc/aip/policy.yaml",
+    "hostname": "worker-node-1.example.com",
+    "container_id": "abc123def456",
+    "pod_uid": "550e8400-e29b-41d4-a716-446655440000"
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `process_id` | int | Yes | OS process ID |
+| `policy_path` | string | Yes | Absolute path to policy file |
+| `hostname` | string | Yes | Normalized hostname (see below) |
+| `container_id` | string | No | Container ID (Docker/containerd) |
+| `pod_uid` | string | No | Kubernetes pod UID |
+
+**Hostname Normalization (v1alpha2)**:
+
+Hostnames MUST be normalized for consistent binding:
+
+```
+NORMALIZE_HOSTNAME():
+  # Priority order (use first available):
+  
+  # 1. Kubernetes pod UID (most stable in k8s)
+  IF env.POD_UID exists:
+    RETURN "k8s:" + env.POD_UID
+  
+  # 2. Container ID (stable within container lifecycle)
+  IF running_in_container():
+    container_id = read_container_id()  # /proc/1/cpuset or cgroup
+    RETURN "container:" + container_id[0:12]
+  
+  # 3. FQDN (prefer over short hostname)
+  IF gethostname() contains ".":
+    RETURN lowercase(gethostname())
+  
+  # 4. Short hostname + domain from resolv.conf
+  hostname = lowercase(gethostname())
+  IF /etc/resolv.conf contains "search" or "domain":
+    domain = first_search_domain()
+    RETURN hostname + "." + domain
+  
+  # 5. Fallback to short hostname
+  RETURN hostname
+```
+
+**Environment-specific binding**:
+
+| Environment | `hostname` Value | Additional Fields |
+|-------------|------------------|-------------------|
+| Bare metal | FQDN | - |
+| VM | FQDN | - |
+| Docker | `container:<id>` | `container_id` |
+| Kubernetes | `k8s:<pod-uid>` | `pod_uid`, `container_id` |
+| Serverless | `lambda:<request-id>` | Implementation-defined |
+
+**Kubernetes deployment**:
+
+For Kubernetes deployments, inject pod UID via downward API:
+
+```yaml
+env:
+  - name: POD_UID
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.uid
+  - name: POD_NAME
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.name
+```
+
+**Session binding modes and hostname**:
+
+| `session_binding` | Hostname Checked | Container ID Checked | Pod UID Checked |
+|-------------------|------------------|---------------------|-----------------|
+| `process` | No | No | No |
+| `policy` | No | No | No |
+| `strict` | Yes | Yes (if present) | Yes (if present) |
+
+**Strict binding in ephemeral environments**:
+
+⚠️ Using `session_binding: "strict"` in Kubernetes or serverless environments may cause issues:
+- Pod restarts change pod UID → tokens invalid
+- Horizontal scaling creates multiple instances → tokens not portable
+
+**Recommendation for Kubernetes**:
+```yaml
+identity:
+  session_binding: "policy"    # Don't bind to ephemeral pod identity
+  require_token: true
+  audience: "https://my-mcp-server.svc.cluster.local"
+```
+
+#### 5.3.1 Token Encoding
+
+Implementations MUST encode tokens using one of the following formats:
+
+| Format | When to Use | Interoperability |
+|--------|-------------|------------------|
+| **JWT** (RFC 7519) | When `server.enabled: true` (REQUIRED) | High - standard format |
+| **Compact** (Base64 JSON) | Local-only deployments | Low - AIP-specific |
+
+**JWT Encoding (REQUIRED for server mode)**:
+
+When `server.enabled: true`, tokens MUST be encoded as RFC 7519 JWTs. This ensures interoperability with external systems and standard JWT libraries.
+
+JWT Header:
+```json
+{
+  "alg": "ES256",
+  "typ": "aip+jwt"
+}
+```
+
+Supported signing algorithms (in order of preference):
+1. `ES256` (ECDSA with P-256 and SHA-256) - RECOMMENDED for production
+2. `EdDSA` (Ed25519) - RECOMMENDED for performance
+3. `HS256` (HMAC-SHA256) - MAY be used only when `server.enabled: false`
+
+⚠️ **Security**: `HS256` requires a shared secret, which is unsuitable for distributed validation. Implementations MUST reject `HS256` tokens on server endpoints.
+
+**Compact Encoding (local-only)**:
+
+When `server.enabled: false`, implementations MAY use compact encoding:
+```
+base64url(json_payload) + "." + base64url(signature)
+```
+
+Compact tokens MUST NOT be sent to remote validation endpoints.
+
+### 5.4 Token Lifecycle
+
+```
+┌──────────────┐
+│   Session    │
+│    Start     │
+└──────┬───────┘
+       │
+       ▼
+┌──────────────┐     ┌──────────────┐
+│    Issue     │────▶│   Active     │
+│    Token     │     │    Token     │
+└──────────────┘     └──────┬───────┘
+                            │
+       ┌────────────────────┼────────────────────┐
+       │                    │                    │
+       ▼                    ▼                    ▼
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│   Rotation   │     │   Expired    │     │   Session    │
+│   (new token)│     │   (reject)   │     │     End      │
+└──────────────┘     └──────────────┘     └──────────────┘
+```
+
+#### 5.4.1 Token Issuance
+
+Tokens are issued when:
+1. Session starts (first tool call with `identity.enabled: true`)
+2. Rotation interval elapsed
+3. Policy changes (new policy_hash)
+
+#### 5.4.2 Token Rotation
+
+Rotation creates a new token while the old token is still valid (grace period).
+
+```
+ROTATE_TOKEN(current_token):
+  IF current_token.expires_at - now() > rotation_grace_period:
+    RETURN current_token  # Not yet time to rotate
+  
+  new_token = ISSUE_TOKEN(
+    session_id: current_token.session_id,  # Preserve session
+    policy_hash: POLICY_HASH(current_policy),
+    agent_id: current_policy.metadata.name,
+    nonce: RANDOM_HEX(32)
+  )
+  
+  RETURN new_token
+```
+
+#### 5.4.3 Token Validation
+
+```
+VALIDATE_TOKEN(token):
+  # Step 0: Check revocation FIRST (before any other validation)
+  revocation_result = CHECK_REVOCATION(token)
+  IF revocation_result == REVOKED:
+    RETURN (INVALID, revocation_result.reason)
+  
+  # Step 1: Check expiration
+  IF now() > token.expires_at:
+    RETURN (INVALID, "token_expired")
+  
+  # Step 2: Check audience (v1alpha2)
+  expected_audience = identity.audience OR current_policy.metadata.name
+  IF token.aud != expected_audience:
+    RETURN (INVALID, "audience_mismatch")
+  
+  # Step 3: Check policy hash
+  IF token.policy_hash != POLICY_HASH(current_policy):
+    # Check if within grace period (if configured)
+    IF policy_transition_grace > 0:
+      IF token.policy_hash IN recent_policy_hashes:
+        # Allow during transition
+        CONTINUE
+    RETURN (INVALID, "policy_changed")
+  
+  # Step 4: Check session binding
+  IF identity.session_binding == "process":
+    IF token.binding.process_id != current_process_id:
+      RETURN (INVALID, "session_mismatch")
+  
+  IF identity.session_binding == "strict":
+    IF token.binding != current_binding:
+      RETURN (INVALID, "binding_mismatch")
+  
+  # Step 5: Check nonce with bounded window (atomic operation required)
+  IF NOT ATOMIC_CHECK_AND_RECORD_NONCE(token.nonce, identity.nonce_window):
+    RETURN (INVALID, "replay_detected")
+  
+  # Step 6: Prune old nonces (may be async)
+  PRUNE_NONCES_OLDER_THAN(now() - identity.nonce_window)
+  
+  RETURN (VALID, nil)
+```
+
+### 5.5 Session Management
+
+#### 5.5.1 Session Start
+
+A session starts when:
+- The AIP engine loads a policy with `identity.enabled: true`
+- A new process starts with AIP configured
+
+#### 5.5.2 Session End
+
+A session ends when:
+- The AIP engine process terminates
+- The policy is unloaded or changed significantly
+- Explicit session termination (implementation-defined)
+
+#### 5.5.3 Session ID
+
+Session IDs MUST be:
+- UUID v4 (random) - RECOMMENDED
+- Globally unique
+- Not predictable
+
+### 5.6 Token and Session Revocation (v1alpha2)
+
+Revocation allows immediate invalidation of tokens or sessions before their natural expiration.
+
+#### 5.6.1 Revocation Targets
+
+| Target | Scope | Use Case |
+|--------|-------|----------|
+| **Token** (by nonce) | Single token | Suspected token compromise |
+| **Session** (by session_id) | All tokens in session | User logout, session termination |
+
+#### 5.6.2 Revocation Storage
+
+Implementations MUST maintain a revocation set containing:
+```json
+{
+  "revoked_sessions": ["<session_id>", ...],
+  "revoked_tokens": ["<nonce>", ...]
+}
+```
+
+Storage requirements:
+- Revoked sessions SHOULD be retained for `max_session_duration` (implementation-defined, default: 24h)
+- Revoked tokens SHOULD be retained for `nonce_window` duration (then naturally expire)
+
+#### 5.6.3 Revocation Check
+
+Token validation MUST include revocation check:
+
+```
+CHECK_REVOCATION(token):
+  IF token.session_id IN revoked_sessions:
+    RETURN (REVOKED, "session_revoked")
+  
+  IF token.nonce IN revoked_tokens:
+    RETURN (REVOKED, "token_revoked")
+  
+  RETURN (VALID, nil)
+```
+
+#### 5.6.4 Local Revocation
+
+For local-only deployments (`server.enabled: false`), implementations SHOULD provide:
+- Signal handler (e.g., `SIGUSR1`) to trigger session termination
+- File-based revocation list that is polled periodically
+- API for programmatic revocation (implementation-defined)
+
+### 5.7 Compatibility with Agentic JWT
+
+AIP Identity Tokens are designed to be **compatible** with the emerging Agentic JWT standard (draft-goswami-agentic-jwt-00).
+
+Implementations MAY support Agentic JWT by:
+1. Computing `agent_checksum` from policy content
+2. Including `agent_proof` claims in JWT tokens
+3. Supporting the `agent_checksum` OAuth grant type
+
+See [Appendix D.6](#d6-agentic-jwt-compatibility) for mapping details.
+
+### 5.8 Key Management (v1alpha2)
+
+This section defines key management requirements for JWT signing when `server.enabled: true`.
+
+#### 5.8.1 Key Configuration
+
+```yaml
+spec:
+  identity:
+    keys:                          # OPTIONAL (v1alpha2)
+      signing_algorithm: <string>  # OPTIONAL, default: "ES256"
+      key_source: <string>         # OPTIONAL, default: "generate"
+      key_path: <string>           # REQUIRED if key_source is "file"
+      rotation_period: <duration>  # OPTIONAL, default: "7d"
+      jwks_endpoint: <string>      # OPTIONAL, default: "/v1/jwks"
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `signing_algorithm` | string | JWT signing algorithm (see 5.8.2) |
+| `key_source` | string | `generate`, `file`, or `external` |
+| `key_path` | string | Path to key file (PEM format) |
+| `rotation_period` | duration | How often to rotate keys |
+| `jwks_endpoint` | string | Endpoint path for JWKS (when server.enabled) |
+
+#### 5.8.2 Supported Algorithms
+
+| Algorithm | Key Type | Security | Performance | Recommendation |
+|-----------|----------|----------|-------------|----------------|
+| `ES256` | ECDSA P-256 | High | Fast | **Default, RECOMMENDED** |
+| `ES384` | ECDSA P-384 | Higher | Medium | High-security environments |
+| `EdDSA` | Ed25519 | High | Fastest | Performance-critical |
+| `RS256` | RSA 2048+ | High | Slow | Legacy compatibility |
+| `HS256` | HMAC | Medium | Fastest | **Local-only, NOT for server mode** |
+
+⚠️ **Security**: `HS256` uses symmetric keys and MUST NOT be used when `server.enabled: true`. Implementations MUST reject this configuration.
+
+#### 5.8.3 Key Sources
+
+**generate** (default):
+```yaml
+keys:
+  key_source: "generate"
+  rotation_period: "7d"
+```
+- Implementation generates and manages keys automatically
+- Private key stored in memory (RECOMMENDED) or encrypted file
+- JWKS endpoint exposes public keys for verification
+
+**file**:
+```yaml
+keys:
+  key_source: "file"
+  key_path: "/etc/aip/signing-key.pem"
+```
+- Key loaded from PEM file
+- Implementation MUST NOT expose private key
+- Key rotation requires file replacement and restart/reload
+
+**external** (future):
+```yaml
+keys:
+  key_source: "external"
+  external:
+    type: "vault"
+    address: "https://vault.example.com"
+    key_name: "aip-signing-key"
+```
+- Keys managed by external KMS (HashiCorp Vault, AWS KMS, etc.)
+- Implementation-defined integration
+
+#### 5.8.4 Key Rotation
+
+Keys SHOULD be rotated periodically to limit exposure from key compromise.
+
+**Rotation process**:
+
+```
+TIME 0:     KEY_A active, KEY_A in JWKS
+TIME T:     KEY_B generated, KEY_A + KEY_B in JWKS
+TIME T+1:   KEY_B active (new tokens), KEY_A + KEY_B in JWKS
+TIME T+TTL: KEY_A removed from JWKS (tokens expired)
+```
+
+**Requirements**:
+1. New keys MUST be added to JWKS before becoming active
+2. Old keys MUST remain in JWKS for at least `token_ttl` after rotation
+3. Implementations MUST support at least 2 concurrent keys in JWKS
+
+**Configuration**:
+```yaml
+identity:
+  keys:
+    rotation_period: "7d"     # Rotate weekly
+    grace_period: "1h"        # Keep old key in JWKS for 1 hour extra
+```
+
+#### 5.8.5 JWKS Endpoint
+
+When `server.enabled: true`, implementations MUST expose a JWKS endpoint for token verification.
+
+**Request**:
+```http
+GET /v1/jwks HTTP/1.1
+Host: aip-server:9443
+```
+
+**Response**:
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+Cache-Control: public, max-age=3600
+
+{
+  "keys": [
+    {
+      "kty": "EC",
+      "crv": "P-256",
+      "kid": "key-2026-01-24",
+      "use": "sig",
+      "alg": "ES256",
+      "x": "...",
+      "y": "..."
+    },
+    {
+      "kty": "EC",
+      "crv": "P-256",
+      "kid": "key-2026-01-17",
+      "use": "sig",
+      "alg": "ES256",
+      "x": "...",
+      "y": "..."
+    }
+  ]
+}
+```
+
+**Caching**:
+- Clients SHOULD cache JWKS responses
+- `Cache-Control` header SHOULD indicate TTL (default: 1 hour)
+- Clients MUST refresh JWKS when encountering unknown `kid`
+
+#### 5.8.6 Key Compromise Response
+
+If a signing key is compromised:
+
+1. **Immediate**: Remove compromised key from JWKS
+2. **Generate**: Create new signing key
+3. **Revoke**: Revoke all sessions that used compromised key
+4. **Rotate**: Force token rotation for all active sessions
+5. **Audit**: Log compromise event with forensic details
+
+**Emergency key revocation endpoint** (implementation-defined):
+
+```http
+POST /v1/keys/revoke HTTP/1.1
+Host: aip-server:9443
+Authorization: Bearer <admin-token>
+Content-Type: application/json
+
+{
+  "kid": "key-2026-01-17",
+  "reason": "Key compromise detected",
+  "revoke_sessions": true
+}
+```
+
+⚠️ **This is a destructive operation** that invalidates all tokens signed with the specified key.
+
+---
+
+## 6. Server-Side Validation (v1alpha2)
+
+This section defines the optional HTTP server for remote policy validation.
+
+### 6.1 Overview
+
+The AIP server provides:
+1. **Remote validation**: Validate tool calls from external systems
+2. **Health checks**: Integration with load balancers and orchestrators
+3. **Metrics**: Prometheus-compatible metrics export
+
+### 6.2 Validation Endpoint
+
+#### 6.2.1 Request Format
+
+```http
+POST /v1/validate HTTP/1.1
+Host: aip-server:9443
+Content-Type: application/json
+Authorization: Bearer <identity-token>
+
+{
+  "tool": "<tool-name>",
+  "arguments": { ... }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `tool` | string | Yes | Tool name to validate |
+| `arguments` | object | Yes | Tool arguments |
+
+**Token Transmission (RFC 6750 compliant)**:
+
+The identity token MUST be transmitted in the `Authorization` header using the Bearer scheme:
+
+```http
+Authorization: Bearer <identity-token>
+```
+
+Implementations MUST NOT accept tokens in:
+- Request body parameters
+- Query string parameters
+- Cookies
+
+This prevents:
+- Token leakage via access logs (query strings)
+- CSRF attacks (body parameters)
+- Cross-origin token theft (cookies)
+
+When `identity.require_token: true`, requests without a valid Authorization header MUST be rejected with HTTP 401.
+
+#### 6.2.2 Response Format
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "decision": "allow|block|ask",
+  "reason": "<human-readable-reason>",
+  "violations": [
+    {
+      "type": "<violation-type>",
+      "field": "<field-name>",
+      "message": "<description>"
+    }
+  ],
+  "token_status": {
+    "valid": true,
+    "expires_in": 240
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `decision` | string | `allow`, `block`, or `ask` |
+| `reason` | string | Human-readable explanation |
+| `violations` | array | List of policy violations (if any) |
+| `token_status` | object | Token validity information (if token provided) |
+
+#### 6.2.3 Error Responses
+
+| HTTP Status | Error Code | Description |
+|-------------|------------|-------------|
+| 400 | `invalid_request` | Malformed request body |
+| 401 | `token_required` | Token required but not provided |
+| 401 | `token_invalid` | Token validation failed |
+| 403 | `forbidden` | Tool not allowed |
+| 429 | `rate_limited` | Rate limit exceeded |
+| 500 | `internal_error` | Server error |
+
+### 6.3 Health Endpoint
+
+#### 6.3.1 Request
+
+```http
+GET /health HTTP/1.1
+Host: aip-server:9443
+```
+
+#### 6.3.2 Response
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "status": "healthy",
+  "version": "v1alpha2",
+  "policy_hash": "<64-char-hex>",
+  "uptime_seconds": 3600
+}
+```
+
+| Status | HTTP Code | Description |
+|--------|-----------|-------------|
+| `healthy` | 200 | Server is ready |
+| `degraded` | 200 | Server running with warnings |
+| `unhealthy` | 503 | Server not ready |
+
+### 6.4 Metrics Endpoint
+
+When enabled, the metrics endpoint exposes Prometheus-compatible metrics.
+
+#### 6.4.1 Request
+
+```http
+GET /metrics HTTP/1.1
+Host: aip-server:9443
+```
+
+#### 6.4.2 Metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `aip_requests_total` | counter | Total validation requests |
+| `aip_decisions_total` | counter | Decisions by type (allow/block/ask) |
+| `aip_violations_total` | counter | Policy violations by type |
+| `aip_token_validations_total` | counter | Token validations (valid/invalid) |
+| `aip_revocations_total` | counter | Revocation events by type (session/token) |
+| `aip_active_sessions` | gauge | Currently active sessions |
+| `aip_request_duration_seconds` | histogram | Request latency |
+| `aip_policy_hash` | gauge | Current policy hash (as label) |
+
+### 6.5 Revocation Endpoint (v1alpha2)
+
+The revocation endpoint allows immediate invalidation of tokens or sessions.
+
+#### 6.5.1 Request Format
+
+```http
+POST /v1/revoke HTTP/1.1
+Host: aip-server:9443
+Content-Type: application/json
+Authorization: Bearer <admin-token>
+
+{
+  "type": "session|token",
+  "session_id": "<uuid>",        // Required if type=session
+  "token_nonce": "<nonce>",      // Required if type=token
+  "reason": "<human-readable>"   // OPTIONAL
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `type` | string | Yes | `session` or `token` |
+| `session_id` | string | Conditional | Session UUID (required if type=session) |
+| `token_nonce` | string | Conditional | Token nonce (required if type=token) |
+| `reason` | string | No | Audit trail reason |
+
+#### 6.5.2 Response Format
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "revoked": true,
+  "type": "session",
+  "target": "550e8400-e29b-41d4-a716-446655440000",
+  "revoked_at": "2026-01-24T10:30:00.000Z"
+}
+```
+
+#### 6.5.3 Error Responses
+
+| HTTP Status | Error Code | Description |
+|-------------|------------|-------------|
+| 400 | `invalid_request` | Missing required fields |
+| 401 | `unauthorized` | Admin authentication required |
+| 404 | `not_found` | Session or token not found |
+| 500 | `internal_error` | Server error |
+
+#### 6.5.4 Authorization
+
+The revocation endpoint MUST require elevated privileges:
+- Separate admin token (not user identity token)
+- mTLS with admin certificate
+- Operator API key
+
+⚠️ **Security**: Revocation is a privileged operation. Do not allow agents to revoke their own or other sessions.
+
+#### 6.5.5 Audit Logging
+
+Revocation events MUST be logged:
+
+```json
+{
+  "timestamp": "2026-01-24T10:30:00.000Z",
+  "event": "REVOCATION",
+  "type": "session",
+  "target": "550e8400-e29b-41d4-a716-446655440000",
+  "reason": "Suspected compromise",
+  "admin": "operator@example.com"
+}
+```
+
+### 6.6 Authentication
+
+The validation endpoint SHOULD be protected. Implementations MUST support:
+- **Bearer tokens**: AIP Identity Tokens in Authorization header
+- **mTLS**: Mutual TLS for service-to-service authentication
+
+Implementations MAY support:
+- API keys
+- OAuth 2.0 tokens (for integration with external IdPs)
+
+---
+
+## 7. Error Codes
+
+AIP defines the following JSON-RPC error codes:
+
+| Code | Name | Description |
+|------|------|-------------|
+| -32001 | Forbidden | Tool not in allowed_tools list |
+| -32002 | Rate Limited | Rate limit exceeded |
+| -32004 | User Denied | User rejected approval prompt |
+| -32005 | User Timeout | Approval prompt timed out |
+| -32006 | Method Not Allowed | JSON-RPC method not permitted |
+| -32007 | Protected Path | Access to protected path blocked |
+| -32008 | Token Required | Identity token required but not provided *(new)* |
+| -32009 | Token Invalid | Identity token validation failed *(new)* |
+| -32010 | Policy Signature Invalid | Policy signature verification failed *(new)* |
+| -32011 | Token Revoked | Token or session explicitly revoked *(new)* |
+| -32012 | Audience Mismatch | Token audience does not match expected value *(new)* |
+| -32013 | Schema Mismatch | Tool schema hash does not match policy *(new)* |
+| -32014 | DLP Redaction Failed | Request redaction produced invalid content *(new)* |
+
+### 7.1 Error Response Format
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": <request_id>,
+  "error": {
+    "code": <error_code>,
+    "message": "<error_message>",
+    "data": {
+      "tool": "<tool_name>",
+      "reason": "<human_readable_reason>"
+    }
+  }
+}
+```
+
+### 7.2 New Error Codes (v1alpha2)
+
+#### -32008 Token Required
+
+Returned when `identity.require_token: true` and no token is provided.
+
+```json
+{
+  "code": -32008,
+  "message": "Token required",
+  "data": {
+    "tool": "file_write",
+    "reason": "Identity token required for this policy"
+  }
+}
+```
+
+#### -32009 Token Invalid
+
+Returned when token validation fails.
+
+```json
+{
+  "code": -32009,
+  "message": "Token invalid",
+  "data": {
+    "tool": "file_write",
+    "reason": "Token expired",
+    "token_error": "token_expired"
+  }
+}
+```
+
+Possible `token_error` values:
+- `token_expired` - Token past expiration time
+- `policy_changed` - Policy hash mismatch
+- `session_mismatch` - Session binding mismatch
+- `binding_mismatch` - Strict binding validation failed
+- `replay_detected` - Nonce reuse detected
+- `audience_mismatch` - Token audience does not match expected value *(new)*
+- `malformed` - Token structure invalid
+
+**Note**: `token_revoked` errors use the dedicated -32011 error code for clearer operational distinction.
+
+#### -32010 Policy Signature Invalid
+
+Returned when policy signature verification fails.
+
+```json
+{
+  "code": -32010,
+  "message": "Policy signature invalid",
+  "data": {
+    "policy": "production-agent",
+    "reason": "Signature verification failed"
+  }
+}
+```
+
+#### -32011 Token Revoked (v1alpha2)
+
+Returned when a token or its session has been explicitly revoked via the revocation endpoint.
+
+```json
+{
+  "code": -32011,
+  "message": "Token revoked",
+  "data": {
+    "tool": "file_write",
+    "reason": "Session revoked by administrator",
+    "revoked_at": "2026-01-24T10:30:00.000Z",
+    "revocation_type": "session"
+  }
+}
+```
+
+Possible `revocation_type` values:
+- `session` - Entire session was revoked (all tokens invalid)
+- `token` - Specific token was revoked (by nonce)
+
+**Operational note**: Error -32011 is distinct from -32009 to enable security teams to differentiate between normal token lifecycle events (expiration) and security incident responses (revocation).
+
+#### -32012 Audience Mismatch (v1alpha2)
+
+Returned when the token's `aud` claim does not match the expected audience.
+
+```json
+{
+  "code": -32012,
+  "message": "Audience mismatch",
+  "data": {
+    "tool": "file_write",
+    "reason": "Token not valid for this service",
+    "expected_audience": "https://mcp.example.com",
+    "token_audience": "https://other-mcp.example.com"
+  }
+}
+```
+
+**Security note**: This error indicates a possible token misuse or attack. The `token_audience` value SHOULD be logged for forensics but MAY be omitted from client responses to prevent information disclosure.
+
+#### -32013 Schema Mismatch (v1alpha2)
+
+Returned when a tool's schema hash does not match the expected value in the policy.
+
+```json
+{
+  "code": -32013,
+  "message": "Schema mismatch",
+  "data": {
+    "tool": "read_file",
+    "reason": "Tool schema has changed since policy was created",
+    "expected_hash": "sha256:a3c7f2e8...",
+    "actual_hash": "sha256:b4d8e3f9..."
+  }
+}
+```
+
+**Security note**: This error indicates a potential tool poisoning attack or uncontrolled tool update. Implementations SHOULD:
+1. Alert security teams immediately
+2. Log full schema details for forensic analysis
+3. Consider blocking the MCP server until verified
+
+---
+
+## 8. Audit Log Format
+
+*[Section 8.1-8.3 remain unchanged from v1alpha1]*
+
+### 8.1 Required Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `timestamp` | ISO 8601 | Time of the decision |
+| `direction` | string | `upstream` (client→server) or `downstream` (server→client) |
+| `decision` | string | `ALLOW`, `BLOCK`, `ALLOW_MONITOR`, `RATE_LIMITED` |
+| `policy_mode` | string | `enforce` or `monitor` |
+| `violation` | boolean | Whether a policy violation was detected |
+
+### 8.2 Optional Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `method` | string | JSON-RPC method name |
+| `tool` | string | Tool name (for tools/call) |
+| `args` | object | Tool arguments (SHOULD be redacted) |
+| `failed_arg` | string | Argument that failed validation |
+| `failed_rule` | string | Regex pattern that failed |
+| `session_id` | string | Session identifier *(new)* |
+| `token_id` | string | Token nonce *(new)* |
+| `policy_hash` | string | Policy hash at decision time *(new)* |
+
+### 8.3 Example
+
+```json
+{
+  "timestamp": "2026-01-24T10:30:45.123Z",
+  "direction": "upstream",
+  "method": "tools/call",
+  "tool": "delete_file",
+  "args": {"path": "/etc/passwd"},
+  "decision": "BLOCK",
+  "policy_mode": "enforce",
+  "violation": true,
+  "failed_arg": "path",
+  "failed_rule": "^/home/.*",
+  "session_id": "550e8400-e29b-41d4-a716-446655440000",
+  "policy_hash": "a3c7f2e8d9b4f1e2c8a7d6f3e9b2c4f1a8e7d3c2b5f4e9a7c3d8f2b6e1a9c4f7"
+}
+```
+
+### 8.4 Identity Events (v1alpha2)
+
+Identity-related events SHOULD be logged:
+
+#### Token Issued
+
+```json
+{
+  "timestamp": "2026-01-24T10:30:00.000Z",
+  "event": "TOKEN_ISSUED",
+  "session_id": "550e8400-e29b-41d4-a716-446655440000",
+  "token_id": "abc123def456",
+  "expires_at": "2026-01-24T10:35:00.000Z",
+  "policy_hash": "a3c7f2e8..."
+}
+```
+
+#### Token Rotated
+
+```json
+{
+  "timestamp": "2026-01-24T10:34:00.000Z",
+  "event": "TOKEN_ROTATED",
+  "session_id": "550e8400-e29b-41d4-a716-446655440000",
+  "old_token_id": "abc123def456",
+  "new_token_id": "xyz789ghi012",
+  "expires_at": "2026-01-24T10:39:00.000Z"
+}
+```
+
+#### Token Validation Failed
+
+```json
+{
+  "timestamp": "2026-01-24T10:36:00.000Z",
+  "event": "TOKEN_VALIDATION_FAILED",
+  "session_id": "550e8400-e29b-41d4-a716-446655440000",
+  "token_id": "abc123def456",
+  "error": "token_expired"
+}
+```
+
+---
+
+## 9. Conformance
+
+### 9.1 Conformance Levels
+
+| Level | Requirements |
+|-------|--------------|
+| **Basic** | Method authorization, tool allowlist, error codes |
+| **Full** | Basic + argument validation, rate limiting, DLP, audit logging |
+| **Extended** | Full + Human-in-the-Loop (action=ask) |
+| **Identity** | Full + Identity tokens, session management *(new)* |
+| **Server** | Identity + Server-side validation endpoints *(new)* |
+
+### 9.2 Conformance Testing
+
+Implementations MUST pass the conformance test suite to claim AIP compliance.
+
+The test suite consists of:
+1. **Schema validation tests**: Verify policy parsing
+2. **Decision tests**: Input → expected decision
+3. **Normalization tests**: Verify Unicode handling
+4. **Error format tests**: Verify JSON-RPC errors
+5. **Identity tests**: Token lifecycle, rotation, validation *(new)*
+6. **Server tests**: HTTP endpoint behavior *(new)*
+
+See `spec/conformance/` for test vectors.
+
+### 9.3 Implementation Requirements
+
+Implementations MUST:
+- Parse `apiVersion: aip.io/v1alpha2` documents
+- Reject documents with unknown `apiVersion`
+- Apply NFKC normalization to names
+- Return specified error codes
+- Support `enforce` and `monitor` modes
+
+Implementations SHOULD:
+- Log decisions in the specified format
+- Support DLP scanning
+- Support rate limiting
+- Support identity tokens (for Identity conformance level)
+
+Implementations MAY:
+- Use any regex engine with RE2 semantics
+- Implement additional security features (egress control, sandboxing)
+- Implement server-side validation (for Server conformance level)
+
+---
+
+## 10. Security Considerations
+
+### 10.0 Threat Model
+
+This section defines the security assumptions and threat model for AIP.
+
+#### 10.0.1 Trust Boundaries
+
+AIP defines the following trust boundaries:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         UNTRUSTED                               │
+│  ┌──────────┐                                                   │
+│  │  Agent   │  AI agent may be manipulated via prompt injection │
+│  └────┬─────┘                                                   │
+│       │                                                         │
+├───────┼─────────────────────────────────────────────────────────┤
+│       │              TRUST BOUNDARY (AIP)                       │
+│       ▼                                                         │
+│  ┌──────────────┐                                               │
+│  │ AIP Policy   │  Policy engine is TRUSTED                     │
+│  │   Engine     │  Policy file integrity assumed                │
+│  └──────┬───────┘                                               │
+│         │                                                       │
+├─────────┼───────────────────────────────────────────────────────┤
+│         │              TRUST BOUNDARY (MCP)                     │
+│         ▼                                                       │
+│  ┌──────────────┐                                               │
+│  │  MCP Server  │  Server behavior is UNTRUSTED                 │
+│  │              │  Tool definitions may be malicious            │
+│  └──────────────┘                                               │
+│                          UNTRUSTED                              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+| Component | Trust Level | Rationale |
+|-----------|-------------|-----------|
+| **User** | Trusted | Defines policy, approves sensitive operations |
+| **Policy file** | Trusted | Integrity verified via signature (when present) |
+| **AIP Engine** | Trusted | Assumed correctly implemented |
+| **Agent (LLM)** | Untrusted | Subject to prompt injection, jailbreaks |
+| **MCP Server** | Untrusted | May be malicious or compromised |
+| **Tool definitions** | Untrusted | May contain poisoned descriptions |
+| **External resources** | Untrusted | May contain indirect prompt injections |
+
+#### 10.0.2 Threats In Scope
+
+AIP is designed to mitigate the following threats:
+
+| Threat | Attack Vector | AIP Mitigation |
+|--------|---------------|----------------|
+| **Unauthorized tool access** | Agent calls tools outside intended scope | `allowed_tools` allowlist, fail-closed default |
+| **Argument manipulation** | Agent passes malicious arguments | `allow_args` regex validation, `strict_args` |
+| **Privilege escalation** | Agent accesses sensitive files | `protected_paths`, path expansion |
+| **Data exfiltration (response)** | Sensitive data in tool responses | DLP scanning with redaction |
+| **Resource exhaustion** | Agent floods tool calls | Rate limiting per tool |
+| **Policy bypass (Unicode)** | Homoglyph attacks on tool names | NFKC normalization |
+| **Session hijacking** | Stolen token reuse | Session binding, nonce tracking |
+| **Policy tampering** | Agent modifies policy | Protected paths, signature verification |
+| **Replay attacks** | Reuse of captured tokens | Nonce validation, short TTL |
+
+#### 10.0.3 Threats Out of Scope
+
+The following threats are explicitly **not addressed** by this specification:
+
+| Threat | Reason | Potential Future Extension |
+|--------|--------|---------------------------|
+| **Network egress** | Platform-specific enforcement | Appendix D.1 |
+| **Tool poisoning** | ✅ **Addressed in v1alpha2** via `schema_hash` | Section 3.5.4 |
+| **Rug pull attacks** | Requires runtime behavior attestation | Future: tool attestation |
+| **Subprocess sandboxing** | OS-specific | Implementation-defined |
+| **Hardware tampering** | Physical security | Out of scope |
+| **Side-channel attacks** | Implementation-specific | Out of scope |
+| **Prompt injection prevention** | LLM-level defense | Complementary to AIP |
+
+#### 10.0.4 Security Assumptions
+
+AIP makes the following assumptions:
+
+1. **Policy integrity**: The policy file has not been tampered with at load time (verified via signature when `metadata.signature` is present)
+2. **Engine integrity**: The AIP implementation is correct and not compromised
+3. **Cryptographic security**: SHA-256, Ed25519, and other algorithms remain secure
+4. **Clock accuracy**: System clocks are reasonably synchronized (within TTL tolerance)
+5. **TLS security**: Transport encryption prevents eavesdropping and tampering
+
+#### 10.0.5 Defense in Depth
+
+AIP implements multiple layers of defense:
+
+```
+Request Flow:
+                                                    
+  Agent Request                                     
+       │                                            
+       ▼                                            
+  ┌────────────────┐                                
+  │ 1. Method      │  Block unauthorized JSON-RPC methods
+  │    Check       │                                
+  └───────┬────────┘                                
+          │                                         
+          ▼                                         
+  ┌────────────────┐                                
+  │ 2. Identity    │  Validate token, session binding
+  │    Check       │  (v1alpha2)                    
+  └───────┬────────┘                                
+          │                                         
+          ▼                                         
+  ┌────────────────┐                                
+  │ 3. Rate Limit  │  Prevent resource exhaustion   
+  │    Check       │                                
+  └───────┬────────┘                                
+          │                                         
+          ▼                                         
+  ┌────────────────┐                                
+  │ 4. Tool        │  Allowlist enforcement         
+  │    Check       │                                
+  └───────┬────────┘                                
+          │                                         
+          ▼                                         
+  ┌────────────────┐                                
+  │ 5. Argument    │  Regex validation, protected paths
+  │    Check       │                                
+  └───────┬────────┘                                
+          │                                         
+          ▼                                         
+  ┌────────────────┐                                
+  │ 6. HITL        │  Human approval for sensitive ops
+  │    (if ask)    │                                
+  └───────┬────────┘                                
+          │                                         
+          ▼                                         
+     MCP Server                                     
+          │                                         
+          ▼                                         
+  ┌────────────────┐                                
+  │ 7. DLP         │  Redact sensitive response data
+  │    Scan        │                                
+  └───────┬────────┘                                
+          │                                         
+          ▼                                         
+     Agent Response                                 
+```
+
+### 10.1 Policy File Protection
+
+The policy file itself MUST be protected from modification by the agent. Implementations MUST automatically add the policy file path to `protected_paths`.
+
+### 10.2 Regex Denial of Service (ReDoS)
+
+Implementations MUST use a regex engine that guarantees linear-time matching (RE2 or equivalent). Pathological patterns like `(a+)+$` MUST NOT cause exponential execution time.
+
+### 10.3 Unicode Normalization
+
+Implementations MUST apply NFKC normalization to prevent homoglyph attacks. However, implementers should be aware that NFKC does not normalize all visually similar characters (e.g., Cyrillic 'а' vs Latin 'a').
+
+### 10.4 Monitor Mode Risks
+
+Monitor mode allows all requests through. Implementations SHOULD warn users when monitor mode is enabled in production environments.
+
+### 10.5 Audit Log Integrity
+
+Audit logs SHOULD be written to a location not writable by the agent. Implementations MAY support log signing or forwarding to external systems.
+
+### 10.6 Identity Token Security (v1alpha2)
+
+#### 10.6.1 Token Storage
+
+Identity tokens SHOULD be stored in memory only, not persisted to disk. If persistence is required, tokens MUST be encrypted at rest.
+
+#### 10.6.2 Token Transmission
+
+Tokens transmitted over the network MUST use TLS 1.2 or later. Implementations MUST NOT send tokens over unencrypted connections.
+
+#### 10.6.3 Token Lifetime
+
+Short token lifetimes (5-15 minutes) limit the window for token theft. Implementations SHOULD NOT allow token_ttl greater than 1 hour.
+
+#### 10.6.4 Replay Prevention
+
+Implementations MUST track nonces to prevent token replay within the `nonce_window` duration.
+
+**Atomic Operation Requirement (v1alpha2)**:
+
+Nonce validation MUST be performed as an **atomic check-and-record** operation to prevent race conditions in concurrent environments:
+
+```
+ATOMIC_CHECK_AND_RECORD_NONCE(nonce, window):
+  # This MUST be atomic - no gap between check and record
+  # Implementation options:
+  #   - Redis: SET nonce 1 NX EX window_seconds
+  #   - PostgreSQL: INSERT ... ON CONFLICT DO NOTHING
+  #   - In-memory: sync.Map with CompareAndSwap
+  
+  IF ATOMIC_SET_IF_NOT_EXISTS(nonce, ttl=window):
+    RETURN TRUE   # Nonce was new, now recorded
+  ELSE:
+    RETURN FALSE  # Nonce already existed (replay attempt)
+```
+
+⚠️ **Critical**: Non-atomic check-then-record implementations have a race condition window where concurrent requests with the same nonce could both pass validation.
+
+**Storage strategies**:
+
+| Strategy | Pros | Cons | Recommended For |
+|----------|------|------|-----------------|
+| In-memory (sync.Map) | Fast, simple | Lost on restart | Single-instance, short TTL |
+| Redis (SET NX EX) | Atomic, distributed | Latency, dependency | Multi-instance (RECOMMENDED) |
+| PostgreSQL (INSERT ON CONFLICT) | Atomic, durable | Higher latency | Multi-instance with DB |
+| Bloom filter | Space efficient | False positives, no TTL | NOT RECOMMENDED |
+
+**Nonce pruning**:
+
+Implementations MUST prune nonces older than `nonce_window` to bound storage:
+
+```
+MAX_NONCES = (expected_requests_per_second * nonce_window_seconds)
+```
+
+Example: 100 req/s with 5m window = 30,000 nonces maximum.
+
+**Distributed deployment requirements**:
+
+In multi-instance deployments:
+
+1. **Shared storage is REQUIRED** - Local-only nonce tracking allows replay across instances
+2. **Atomic operations are REQUIRED** - Use storage primitives that guarantee atomicity (Redis `SET NX`, DB unique constraints)
+3. **TTL-based expiration** - Set storage TTL to `nonce_window + clock_skew_tolerance` (recommended: 30 seconds tolerance)
+4. **Clock synchronization** - All instances SHOULD use NTP with drift < 1 second
+
+**Configuration for distributed deployments**:
+
+```yaml
+identity:
+  enabled: true
+  nonce_window: "5m"
+  nonce_storage:                    # OPTIONAL (v1alpha2)
+    type: "redis"                   # redis | postgres | memory
+    address: "redis://localhost:6379"
+    key_prefix: "aip:nonce:"
+    clock_skew_tolerance: "30s"     # Added to TTL for safety
+```
+
+A token with a previously-seen nonce MUST be rejected with error code -32009 (`replay_detected`).
+
+#### 10.6.5 Session Binding
+
+Session binding prevents stolen tokens from being used in different contexts. The `strict` binding mode provides the strongest guarantees but may cause issues with process restarts.
+
+### 10.7 Server Endpoint Security (v1alpha2)
+
+#### 10.7.1 Authentication
+
+Validation endpoints MUST require authentication. Unauthenticated endpoints allow attackers to probe policy configurations.
+
+#### 10.7.2 Rate Limiting
+
+Validation endpoints SHOULD implement rate limiting to prevent denial of service attacks.
+
+#### 10.7.3 Information Disclosure
+
+Error responses SHOULD NOT reveal detailed policy configuration. The `reason` field SHOULD provide minimal information needed to diagnose issues.
+
+---
+
+## 11. IANA Considerations
+
+This specification requests registration of the following:
+
+### 11.1 Media Type
+
+- Type name: application
+- Subtype name: vnd.aip.policy+yaml
+- Required parameters: None
+- File extension: .yaml, .yml
+
+### 11.2 URI Scheme
+
+This specification uses the `aip.io` namespace for versioning:
+- `aip.io/v1alpha1` - Previous specification
+- `aip.io/v1alpha2` - This specification
+
+---
+
+## Appendix A: Complete Schema Reference
+
+```yaml
+# Complete AgentPolicy schema (v1alpha2)
+
+apiVersion: aip.io/v1alpha2      # REQUIRED
+kind: AgentPolicy                 # REQUIRED
+
+metadata:                         # REQUIRED
+  name: string                    # REQUIRED - Policy identifier
+  version: string                 # OPTIONAL - Semantic version
+  owner: string                   # OPTIONAL - Contact email
+  signature: string               # OPTIONAL - Policy signature (v1alpha2)
+
+spec:                             # REQUIRED
+  mode: enforce | monitor         # OPTIONAL, default: enforce
+  
+  allowed_tools:                  # OPTIONAL
+    - string
+  
+  allowed_methods:                # OPTIONAL
+    - string
+  
+  denied_methods:                 # OPTIONAL
+    - string
+  
+  protected_paths:                # OPTIONAL
+    - string
+  
+  strict_args_default: boolean    # OPTIONAL, default: false
+  
+  tool_rules:                     # OPTIONAL
+    - tool: string                # REQUIRED
+      action: allow|block|ask     # OPTIONAL, default: allow
+      rate_limit: string          # OPTIONAL, format: "N/period"
+      strict_args: boolean        # OPTIONAL
+      schema_hash: string         # OPTIONAL - Tool schema integrity (v1alpha2)
+      allow_args:                 # OPTIONAL
+        <arg_name>: <regex>
+  
+  dlp:                            # OPTIONAL
+    enabled: boolean              # OPTIONAL, default: true
+    scan_requests: boolean        # OPTIONAL, default: false (v1alpha2)
+    scan_responses: boolean       # OPTIONAL, default: true (v1alpha2)
+    detect_encoding: boolean      # OPTIONAL, default: false
+    filter_stderr: boolean        # OPTIONAL, default: false
+    max_scan_size: string         # OPTIONAL, default: "1MB" (v1alpha2)
+    on_request_match: string      # OPTIONAL, default: "block" (v1alpha2)
+    on_redaction_failure: string  # OPTIONAL, default: "block" (v1alpha2)
+    log_original_on_failure: boolean  # OPTIONAL, default: false (v1alpha2)
+    patterns:                     # REQUIRED if dlp present
+      - name: string              # REQUIRED
+        regex: string             # REQUIRED
+        scope: string             # OPTIONAL, default: "all" (v1alpha2)
+  
+  identity:                       # OPTIONAL (v1alpha2)
+    enabled: boolean              # OPTIONAL, default: false
+    token_ttl: string             # OPTIONAL, default: "5m"
+    rotation_interval: string     # OPTIONAL, default: "4m" (must be < token_ttl)
+    require_token: boolean        # OPTIONAL, default: false
+    session_binding: string       # OPTIONAL, default: "process"
+    nonce_window: string          # OPTIONAL, default: equals token_ttl
+    policy_transition_grace: string  # OPTIONAL, default: "0s"
+    audience: string              # OPTIONAL, default: metadata.name
+    nonce_storage:                # OPTIONAL (v1alpha2)
+      type: string                # memory | redis | postgres
+      address: string             # Connection string (if not memory)
+      key_prefix: string          # default: "aip:nonce:"
+      clock_skew_tolerance: string  # default: "30s"
+    keys:                         # OPTIONAL (v1alpha2)
+      signing_algorithm: string   # default: "ES256"
+      key_source: string          # generate | file | external
+      key_path: string            # Required if key_source is "file"
+      rotation_period: string     # default: "7d"
+      jwks_endpoint: string       # default: "/v1/jwks"
+  
+  server:                         # OPTIONAL (v1alpha2)
+    enabled: boolean              # OPTIONAL, default: false
+    listen: string                # OPTIONAL, default: "127.0.0.1:9443"
+    failover_mode: string         # OPTIONAL, default: "fail_closed"
+    timeout: string               # OPTIONAL, default: "5s"
+    tls:                          # OPTIONAL
+      cert: string                # Path to TLS certificate
+      key: string                 # Path to TLS private key
+    fail_open_constraints:        # OPTIONAL (recommended if fail_open)
+      allowed_tools:              # Only these tools fail-open
+        - string
+      max_duration: string        # Auto-revert after duration
+      max_requests: integer       # Auto-revert after N requests
+      alert_webhook: string       # Notify on fail_open activation
+      require_local_policy: boolean  # Require valid local policy
+    endpoints:                    # OPTIONAL
+      validate: string            # default: "/v1/validate"
+      revoke: string              # default: "/v1/revoke"
+      jwks: string                # default: "/v1/jwks" (v1alpha2)
+      health: string              # default: "/health"
+      metrics: string             # default: "/metrics"
+```
+
+---
+
+## Appendix B: Changelog
+
+### v1alpha2 (2026-01-24)
+
+**Identity and Session Management**
+- Added `identity` configuration section
+  - Token generation and rotation with configurable TTL
+  - Session binding (`process`, `policy`, `strict`)
+  - Policy hash computation for integrity
+  - `nonce_window` for bounded replay prevention storage
+  - `policy_transition_grace` for gradual policy rollouts
+  - `audience` for token audience binding (RFC 8707 alignment)
+  - `nonce_storage` for distributed nonce tracking (Redis, PostgreSQL)
+  - `keys` for JWT signing key management and rotation
+- Added token revocation mechanism (Section 5.6)
+  - Session and token-level revocation
+  - Revocation storage and pruning
+- Added Section 5.8 Key Management
+  - Signing algorithm selection (ES256, EdDSA, RS256)
+  - Key rotation with grace periods
+  - JWKS endpoint for remote verification
+  - Key compromise response procedures
+- Added Section 5.3.2 Binding Object
+  - Hostname normalization for containers and Kubernetes
+  - Container ID and Pod UID binding support
+
+**Server-Side Validation**
+- Added `server` configuration section
+  - HTTP validation endpoint (`/v1/validate`)
+  - Revocation endpoint (`/v1/revoke`)
+  - JWKS endpoint (`/v1/jwks`) for key distribution
+  - Health and metrics endpoints
+  - `failover_mode`: `fail_closed`, `fail_open`, `local_policy`
+  - `fail_open_constraints` for safer fail_open deployments
+  - Configurable `timeout` for validation requests
+- Mandated JWT encoding when `server.enabled: true`
+- Token transmission via Authorization header only (RFC 6750)
+
+**Tool Security**
+- Added `schema_hash` to tool_rules (Section 3.5.4)
+  - Cryptographic verification of tool definitions
+  - Tool poisoning attack prevention
+  - SHA-256/384/512 algorithm support
+
+**DLP Enhancements**
+- Added `scan_requests` for request-side DLP scanning
+- Added `max_scan_size` to prevent ReDoS
+- Added `on_request_match` action (`block`, `redact`, `warn`)
+- Added `on_redaction_failure` handling (`block`, `allow_original`, `reject`)
+- Added `log_original_on_failure` for forensics
+- Added `scope` to patterns (`request`, `response`, `all`)
+
+**Security**
+- Added Section 10.0 Threat Model
+  - Trust boundaries diagram
+  - Threats in scope / out of scope
+  - Defense in depth layers
+- Added `metadata.signature` for policy integrity (Ed25519)
+- Atomic nonce operations required for replay prevention
+- Tool poisoning now addressed via schema hashing
+- Enhanced replay prevention documentation with distributed storage
+
+**Configuration Validation**
+- Added rotation_interval validation (must be < token_ttl)
+- Policy load failures for invalid configurations
+
+**Error Codes**
+- Added -32008 Token Required
+- Added -32009 Token Invalid (with detailed error types)
+- Added -32010 Policy Signature Invalid
+- Added -32011 Token Revoked (distinct from -32009)
+- Added -32012 Audience Mismatch
+- Added -32013 Schema Mismatch (tool poisoning detection)
+- Added -32014 DLP Redaction Failed
+
+**Conformance**
+- Added Identity conformance level
+- Added Server conformance level
+- Added identity and server tests to conformance suite
+
+### v1alpha1 (2026-01-20)
+
+- Initial draft specification
+- Defined core policy schema
+- Defined evaluation semantics
+- Defined error codes
+- Defined audit log format
+
+---
+
+## Appendix C: References
+
+- [Model Context Protocol (MCP)](https://modelcontextprotocol.io/)
+- [MCP Authorization (2025-06-18)](https://modelcontextprotocol.io/specification/2025-06-18/basic/authorization)
+- [JSON-RPC 2.0 Specification](https://www.jsonrpc.org/specification)
+- [RFC 2119 - Key words for use in RFCs](https://www.rfc-editor.org/rfc/rfc2119)
+- [RFC 7519 - JSON Web Token (JWT)](https://www.rfc-editor.org/rfc/rfc7519)
+- [RFC 8785 - JSON Canonicalization Scheme (JCS)](https://www.rfc-editor.org/rfc/rfc8785)
+- [Unicode NFKC Normalization](https://unicode.org/reports/tr15/)
+- [RE2 Syntax](https://github.com/google/re2/wiki/Syntax)
+- [Agentic JWT (draft-goswami-agentic-jwt-00)](https://datatracker.ietf.org/doc/html/draft-goswami-agentic-jwt-00)
+
+---
+
+## Appendix D: Future Extensions
+
+This appendix describes features under consideration for future versions of AIP.
+
+### D.1 Network Egress Control
+
+**Status:** Proposed for v1beta1
+
+*[Content unchanged from v1alpha1]*
+
+### D.2 Policy Inheritance
+
+**Status:** Under Discussion
+
+Allow policies to extend base policies:
+
+```yaml
+apiVersion: aip.io/v1beta1
+kind: AgentPolicy
+metadata:
+  name: team-policy
+spec:
+  extends: "org-base-policy"  # Inherit from another policy
+  allowed_tools:
+    - additional_tool          # Add to parent's list
+```
+
+### D.3 External Identity Federation
+
+**Status:** Proposed for v1beta1
+
+Allow policies to integrate with external identity providers:
+
+```yaml
+spec:
+  identity:
+    federation:
+      type: oidc
+      issuer: "https://accounts.google.com"
+      client_id: "aip-agent"
+      required_claims:
+        email_verified: true
+        hd: "company.com"
+```
+
+Supported federation types:
+- `oidc` - OpenID Connect providers
+- `spiffe` - SPIFFE/SPIRE workload identity
+
+### D.4 Telemetry and Metrics
+
+**Status:** Partially implemented in v1alpha2 (metrics endpoint)
+
+Full telemetry specification:
+
+```yaml
+spec:
+  telemetry:
+    metrics:
+      enabled: true
+      format: "prometheus"   # prometheus | otlp
+    traces:
+      enabled: true
+      endpoint: "http://jaeger:14268/api/traces"
+      format: "otlp"
+      sampling_rate: 0.1
+```
+
+### D.5 Advanced Policy Expressions
+
+**Status:** Under Discussion
+
+Support for CEL (Common Expression Language) or Rego for complex validation:
+
+```yaml
+tool_rules:
+  - tool: file_write
+    action: allow
+    when: |
+      args.path.startsWith("/allowed/") &&
+      !args.path.contains("..") &&
+      size(args.content) < 1048576
+```
+
+### D.6 Agentic JWT Compatibility
+
+**Status:** Under Discussion for v1beta1
+
+Full compatibility with the Agentic JWT specification:
+
+```yaml
+spec:
+  identity:
+    agentic_jwt:
+      enabled: true
+      # Agent checksum computed from:
+      # - policy content (tools, rules)
+      # - metadata (name, version)
+      include_tool_definitions: true
+      # Support for workflow binding
+      workflow:
+        id: "data-processing-v1"
+        steps:
+          - analyze
+          - transform
+          - export
+```
+
+Mapping to Agentic JWT claims:
+
+| AIP Field | Agentic JWT Claim |
+|-----------|-------------------|
+| `policy_hash` | `agent_proof.agent_checksum` |
+| `session_id` | `intent.workflow_id` |
+| `metadata.name` | `sub` (subject) |
+| `tool_rules` | Workflow steps |
+
+---
+
+## Appendix E: Implementation Notes
+
+### E.1 Reference Implementation
+
+The reference implementation is available at:
+https://github.com/ArangoGutierrez/agent-identity-protocol
+
+It provides:
+- Go-based proxy (`aip-proxy`)
+- Policy engine (`pkg/policy`)
+- DLP scanner (`pkg/dlp`)
+- Audit logger (`pkg/audit`)
+- Identity manager (`pkg/identity`) *(v1alpha2)*
+- HTTP server (`pkg/server`) *(v1alpha2)*
+
+### E.2 Testing Against Conformance Suite
+
+```bash
+# Clone the spec repository
+git clone https://github.com/ArangoGutierrez/agent-identity-protocol
+
+# Run conformance tests against your implementation
+cd agent-identity-protocol/spec/conformance
+./run-tests.sh --impl "your-aip-binary" --level "identity"
+```
+
+### E.3 Token Implementation Guidance
+
+#### Generating Secure Nonces
+
+```go
+import "crypto/rand"
+
+func generateNonce() string {
+    b := make([]byte, 16)
+    rand.Read(b)
+    return hex.EncodeToString(b)
+}
+```
+
+#### Computing Policy Hash
+
+```go
+import (
+    "crypto/sha256"
+    "encoding/json"
+)
+
+func computePolicyHash(policy *AgentPolicy) string {
+    // Remove signature for hashing
+    policyCopy := *policy
+    policyCopy.Metadata.Signature = ""
+    
+    // Canonical JSON (keys sorted)
+    canonical, _ := json.Marshal(policyCopy)
+    
+    hash := sha256.Sum256(canonical)
+    return hex.EncodeToString(hash[:])
+}
+```
+
+### E.4 Registering Your Implementation
+
+Implementations that pass the conformance suite may be listed in the official registry. Submit a PR to the AIP repository with:
+- Implementation name and URL
+- Conformance level achieved (Basic/Full/Extended/Identity/Server)
+- Platform support matrix

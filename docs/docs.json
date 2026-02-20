@@ -1,0 +1,109 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "aspen",
+  "name": "Agent Identity Protocol",
+  "colors": {
+    "primary": "#16A34A",
+    "light": "#07C983",
+    "dark": "#15803D"
+  },
+  "favicon": "/favicon.svg",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Guides",
+        "groups": [
+          {
+            "group": "Getting started",
+            "pages": [
+              "index",
+              "why-AIP"
+            ]
+          },
+          {
+            "group": "About AIP",
+            "pages": [
+              "architecture",
+               {
+                "group": "Layer 1 - Identity Attestation",
+                "pages": [
+                  "layer-1-identity/identity-workflow"
+                ]
+              },
+              {
+                "group": "Layer 2 - Enforcement",
+                "pages": [
+                  "layer-2-enforcement/policy-reference"
+                ]
+              },
+              {
+                "group": "Specifications",
+                "pages": [
+                  "specs/aip-v1alpha1",
+                  "specs/aip-v1alpha2",
+                  "specs/aip-v1alpha3"
+                ]
+              },
+              "faq"
+            ]
+          },
+          {
+            "group": "Developing with AIP",
+            "pages": [
+              "SDKs"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Community",
+        "groups": [
+          {
+            "group": "Github",
+            "pages": [
+              "community/introduction"
+            ]
+          },
+          {
+            "group": "Contributing",
+            "pages": [
+              "community/contributing",
+              "community/contributing-policy"
+            ]
+          }
+        ]
+      }
+    ],
+    "global": {
+      "anchors": [
+     
+      ]
+    }
+  },
+  "logo": {
+    "light": "/logo/light.svg",
+    "dark": "/logo/dark.svg"
+  },
+  "navbar": {
+    "primary": {
+      "type": "button",
+      "label": "Github",
+      "href": "https://github.com/openagentidentityprotocol"
+    }
+  },
+  "contextual": {
+    "options": [
+     "copy",
+     "view",
+     "chatgpt",
+     "claude",
+     "perplexity"
+   ]
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/openagentidentityprotocol"
+    }
+  },
+  "description": "The standard for AI agent identity attestation"
+}

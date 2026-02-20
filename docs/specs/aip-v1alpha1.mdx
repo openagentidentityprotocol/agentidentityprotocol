@@ -1,0 +1,846 @@
+---
+title: "AIP v1alpha1"
+---
+
+# Agent Identity Protocol (AIP) Specification
+
+**Version:** v1alpha1  
+**Status:** Draft  
+**Last Updated:** 2026-01-20  
+**Authors:** Eduardo Arango (arangogutierrez@gmail.com)
+
+---
+
+## Abstract
+
+The Agent Identity Protocol (AIP) defines a standard for policy-based authorization of AI agent tool calls. AIP enables runtime environments to enforce fine-grained access control over Model Context Protocol (MCP) tool invocations, providing a security boundary between AI agents and external resources.
+
+This specification defines:
+1. The policy document schema (`AgentPolicy`)
+2. Evaluation semantics for authorization decisions
+3. Error codes for denied requests
+4. Audit log format for compliance
+
+AIP is designed to be implementation-agnostic. Any MCP-compatible runtime (Cursor, Claude Desktop, VS Code, custom implementations) can implement this specification.
+
+---
+
+## Table of Contents
+
+1. [Introduction](#1-introduction)
+2. [Terminology](#2-terminology)
+3. [Policy Document Schema](#3-policy-document-schema)
+4. [Evaluation Semantics](#4-evaluation-semantics)
+5. [Error Codes](#5-error-codes)
+6. [Audit Log Format](#6-audit-log-format)
+7. [Conformance](#7-conformance)
+8. [Security Considerations](#8-security-considerations)
+9. [IANA Considerations](#9-iana-considerations)
+
+**Appendices**
+- [Appendix A: Complete Schema Reference](#appendix-a-complete-schema-reference)
+- [Appendix B: Changelog](#appendix-b-changelog)
+- [Appendix C: References](#appendix-c-references)
+- [Appendix D: Future Extensions](#appendix-d-future-extensions)
+- [Appendix E: Implementation Notes](#appendix-e-implementation-notes)
+
+---
+
+## 1. Introduction
+
+### 1.1 Motivation
+
+AI agents operating through the Model Context Protocol (MCP) have access to powerful tools: file systems, databases, APIs, and cloud infrastructure. Without a policy layer, agents operate with unrestricted access to any tool the MCP server exposes.
+
+AIP addresses this gap by introducing:
+- **Capability declaration**: Explicit allowlists of permitted tools
+- **Argument validation**: Regex-based constraints on tool parameters
+- **Human-in-the-loop**: Interactive approval for sensitive operations
+- **Audit trail**: Immutable logging of all authorization decisions
+
+### 1.2 Goals
+
+1. **Interoperability**: Any MCP runtime can implement AIP
+2. **Simplicity**: YAML-based policies readable by security teams
+3. **Defense in depth**: Multiple layers (method, tool, argument)
+4. **Fail-closed**: Unknown tools are denied by default
+
+### 1.3 Non-Goals
+
+The following are explicitly out of scope for **this version** of the specification:
+- Network egress control (see [Appendix D: Future Extensions](#appendix-d-future-extensions))
+- Subprocess sandboxing (implementation-defined)
+- Identity federation (future specification)
+- Rate limiting algorithms (implementation-defined)
+
+### 1.4 Relationship to MCP
+
+AIP is designed as a security layer for MCP. It intercepts `tools/call` requests and applies policy checks before forwarding to the MCP server.
+
+```
+┌─────────┐     ┌─────────────┐     ┌─────────────┐
+│  Agent  │────▶│ AIP Policy  │────▶│ MCP Server  │
+│         │◀────│   Engine    │◀────│             │
+└─────────┘     └─────────────┘     └─────────────┘
+```
+
+---
+
+## 2. Terminology
+
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119).
+
+| Term | Definition |
+|------|------------|
+| **Agent** | An AI system that invokes MCP tools on behalf of a user |
+| **Policy** | A document specifying authorization rules (AgentPolicy) |
+| **Tool** | An MCP tool exposed by an MCP server |
+| **Decision** | The result of policy evaluation: ALLOW, BLOCK, or ASK |
+| **Violation** | A policy rule was triggered (may or may not block) |
+
+---
+
+## 3. Policy Document Schema
+
+### 3.1 Document Structure
+
+An AIP policy document is a YAML file with the following top-level structure:
+
+```yaml
+apiVersion: aip.io/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: <string>
+  version: <string>           # OPTIONAL
+  owner: <string>             # OPTIONAL
+spec:
+  mode: <string>              # OPTIONAL, default: "enforce"
+  allowed_tools: [<string>]   # OPTIONAL
+  allowed_methods: [<string>] # OPTIONAL
+  denied_methods: [<string>]  # OPTIONAL
+  tool_rules: [<ToolRule>]    # OPTIONAL
+  protected_paths: [<string>] # OPTIONAL
+  strict_args_default: <bool> # OPTIONAL, default: false
+  dlp: <DLPConfig>            # OPTIONAL
+```
+
+### 3.2 Required Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `apiVersion` | string | MUST be `aip.io/v1alpha1` |
+| `kind` | string | MUST be `AgentPolicy` |
+| `metadata.name` | string | Unique identifier for this policy |
+
+### 3.3 Metadata
+
+```yaml
+metadata:
+  name: <string>      # REQUIRED - Policy identifier
+  version: <string>   # OPTIONAL - Semantic version (e.g., "1.0.0")
+  owner: <string>     # OPTIONAL - Contact email
+```
+
+### 3.4 Spec Fields
+
+#### 3.4.1 mode
+
+Controls enforcement behavior.
+
+| Value | Behavior |
+|-------|----------|
+| `enforce` | Violations are blocked (default) |
+| `monitor` | Violations are logged but allowed |
+
+Implementations MUST support both modes.
+
+#### 3.4.2 allowed_tools
+
+A list of tool names that the agent MAY invoke.
+
+```yaml
+allowed_tools:
+  - github_get_repo
+  - read_file
+  - list_directory
+```
+
+Tool names are subject to normalization (see Section 4.1).
+
+#### 3.4.3 allowed_methods
+
+A list of JSON-RPC methods that are permitted. If not specified, implementations MUST use the default safe list:
+
+```yaml
+# Default allowed methods (when not specified)
+allowed_methods:
+  - initialize
+  - initialized
+  - ping
+  - tools/call
+  - tools/list
+  - completion/complete
+  - notifications/initialized
+  - notifications/progress
+  - notifications/message
+  - notifications/resources/updated
+  - notifications/resources/list_changed
+  - notifications/tools/list_changed
+  - notifications/prompts/list_changed
+  - cancelled
+```
+
+The wildcard `*` MAY be used to allow all methods.
+
+#### 3.4.4 denied_methods
+
+A list of JSON-RPC methods that are explicitly denied. Denied methods take precedence over allowed methods.
+
+```yaml
+denied_methods:
+  - resources/read
+  - resources/write
+```
+
+#### 3.4.5 protected_paths
+
+A list of file paths that tools MUST NOT access. Any tool argument containing a protected path MUST be blocked.
+
+```yaml
+protected_paths:
+  - ~/.ssh
+  - ~/.aws/credentials
+  - .env
+```
+
+Implementations MUST:
+- Expand `~` to the user's home directory
+- Automatically protect the policy file itself
+
+#### 3.4.6 strict_args_default
+
+When `true`, tool rules reject any arguments not explicitly declared in `allow_args`.
+
+Default: `false`
+
+### 3.5 Tool Rules
+
+Tool rules provide fine-grained control over specific tools.
+
+```yaml
+tool_rules:
+  - tool: <string>              # REQUIRED - Tool name
+    action: <string>            # OPTIONAL - allow|block|ask (default: allow)
+    rate_limit: <string>        # OPTIONAL - e.g., "10/minute"
+    strict_args: <bool>         # OPTIONAL - Override strict_args_default
+    allow_args:                 # OPTIONAL
+      <arg_name>: <regex>
+```
+
+#### 3.5.1 Actions
+
+| Action | Behavior |
+|--------|----------|
+| `allow` | Permit (subject to argument validation) |
+| `block` | Deny unconditionally |
+| `ask` | Require interactive user approval |
+
+#### 3.5.2 Rate Limiting
+
+Format: `<count>/<period>`
+
+| Period | Aliases |
+|--------|---------|
+| `second` | `sec`, `s` |
+| `minute` | `min`, `m` |
+| `hour` | `hr`, `h` |
+
+Example: `"10/minute"`, `"100/hour"`, `"5/second"`
+
+Rate limiting algorithm is implementation-defined (token bucket, sliding window, etc.).
+
+#### 3.5.3 Argument Validation
+
+The `allow_args` field maps argument names to regex patterns.
+
+```yaml
+allow_args:
+  url: "^https://github\\.com/.*"
+  query: "^SELECT\\s+.*"
+```
+
+Implementations MUST:
+- Use a regex engine with linear-time guarantees (RE2 or equivalent)
+- Match against the string representation of the argument value
+- Treat missing constrained arguments as a violation
+
+### 3.6 DLP Configuration
+
+Data Loss Prevention (DLP) scans tool responses for sensitive data.
+
+```yaml
+dlp:
+  enabled: <bool>             # OPTIONAL, default: true when dlp block present
+  detect_encoding: <bool>     # OPTIONAL, default: false
+  filter_stderr: <bool>       # OPTIONAL, default: false
+  patterns:
+    - name: <string>          # REQUIRED - Rule identifier
+      regex: <string>         # REQUIRED - Detection pattern
+```
+
+When a pattern matches, the matched content MUST be replaced with:
+```
+[REDACTED:<name>]
+```
+
+---
+
+## 4. Evaluation Semantics
+
+### 4.1 Name Normalization
+
+Tool names and method names MUST be normalized before comparison using the following algorithm:
+
+```
+NORMALIZE(input):
+  1. Apply NFKC Unicode normalization
+  2. Convert to lowercase
+  3. Trim leading/trailing whitespace
+  4. Remove non-printable and control characters
+  5. Return result
+```
+
+This prevents bypass attacks using:
+- Fullwidth characters: `ｄｅｌｅｔｅ` → `delete`
+- Ligatures: `ﬁle` → `file`
+- Zero-width characters: `dele​te` → `delete`
+
+### 4.2 Method-Level Authorization
+
+Method authorization is the FIRST line of defense, evaluated BEFORE tool-level checks.
+
+```
+IS_METHOD_ALLOWED(method):
+  normalized = NORMALIZE(method)
+  
+  IF normalized IN denied_methods:
+    RETURN DENY
+  
+  IF "*" IN allowed_methods:
+    RETURN ALLOW
+  
+  IF normalized IN allowed_methods:
+    RETURN ALLOW
+  
+  RETURN DENY
+```
+
+### 4.3 Tool-Level Authorization
+
+Tool authorization applies to `tools/call` requests.
+
+```
+IS_TOOL_ALLOWED(tool_name, arguments):
+  normalized = NORMALIZE(tool_name)
+  
+  # Step 1: Check rate limiting
+  IF rate_limiter_exceeded(normalized):
+    RETURN RATE_LIMITED
+  
+  # Step 2: Check protected paths
+  IF arguments_contain_protected_path(arguments):
+    RETURN PROTECTED_PATH
+  
+  # Step 3: Check tool rules
+  rule = find_rule(normalized)
+  IF rule EXISTS:
+    IF rule.action == "block":
+      RETURN BLOCK
+    IF rule.action == "ask":
+      IF validate_arguments(rule, arguments):
+        RETURN ASK
+      ELSE:
+        RETURN BLOCK
+    # action == "allow" falls through
+  
+  # Step 4: Check allowed_tools list
+  IF normalized NOT IN allowed_tools:
+    RETURN BLOCK
+  
+  # Step 5: Validate arguments (if rule exists)
+  IF rule EXISTS AND rule.allow_args NOT EMPTY:
+    IF NOT validate_arguments(rule, arguments):
+      RETURN BLOCK
+  
+  # Step 6: Strict args check
+  IF strict_args_enabled(rule):
+    IF arguments has undeclared keys:
+      RETURN BLOCK
+  
+  RETURN ALLOW
+```
+
+### 4.4 Decision Outcomes
+
+| Decision | Mode=enforce | Mode=monitor |
+|----------|--------------|--------------|
+| ALLOW | Forward request | Forward request |
+| BLOCK | Return error | Forward request, log violation |
+| ASK | Prompt user | Prompt user |
+| RATE_LIMITED | Return error | Return error (always enforced) |
+| PROTECTED_PATH | Return error | Return error (always enforced) |
+
+### 4.5 Argument Validation
+
+```
+VALIDATE_ARGUMENTS(rule, arguments):
+  FOR EACH (arg_name, pattern) IN rule.allow_args:
+    IF arg_name NOT IN arguments:
+      RETURN FALSE  # Required argument missing
+    
+    value = STRING(arguments[arg_name])
+    IF NOT REGEX_MATCH(pattern, value):
+      RETURN FALSE
+  
+  RETURN TRUE
+```
+
+The `STRING()` function converts values to string representation:
+- String → as-is
+- Number → decimal representation
+- Boolean → "true" or "false"
+- Null → empty string
+- Array/Object → JSON serialization
+
+---
+
+## 5. Error Codes
+
+AIP defines the following JSON-RPC error codes:
+
+| Code | Name | Description |
+|------|------|-------------|
+| -32001 | Forbidden | Tool not in allowed_tools list |
+| -32002 | Rate Limited | Rate limit exceeded |
+| -32004 | User Denied | User rejected approval prompt |
+| -32005 | User Timeout | Approval prompt timed out |
+| -32006 | Method Not Allowed | JSON-RPC method not permitted |
+| -32007 | Protected Path | Access to protected path blocked |
+
+### 5.1 Error Response Format
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": <request_id>,
+  "error": {
+    "code": <error_code>,
+    "message": "<error_message>",
+    "data": {
+      "tool": "<tool_name>",
+      "reason": "<human_readable_reason>"
+    }
+  }
+}
+```
+
+### 5.2 Error Code Details
+
+#### -32001 Forbidden
+
+Returned when a tool is not in the `allowed_tools` list and has no `tool_rules` entry with `action: allow`.
+
+```json
+{
+  "code": -32001,
+  "message": "Forbidden",
+  "data": {
+    "tool": "dangerous_tool",
+    "reason": "Tool not in allowed_tools list"
+  }
+}
+```
+
+#### -32002 Rate Limited
+
+Returned when a tool's rate limit is exceeded.
+
+```json
+{
+  "code": -32002,
+  "message": "Rate limit exceeded",
+  "data": {
+    "tool": "list_gpus",
+    "reason": "Rate limit exceeded for list_gpus. Try again later."
+  }
+}
+```
+
+---
+
+## 6. Audit Log Format
+
+Implementations SHOULD log all authorization decisions in JSON Lines format.
+
+### 6.1 Required Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `timestamp` | ISO 8601 | Time of the decision |
+| `direction` | string | `upstream` (client→server) or `downstream` (server→client) |
+| `decision` | string | `ALLOW`, `BLOCK`, `ALLOW_MONITOR`, `RATE_LIMITED` |
+| `policy_mode` | string | `enforce` or `monitor` |
+| `violation` | boolean | Whether a policy violation was detected |
+
+### 6.2 Optional Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `method` | string | JSON-RPC method name |
+| `tool` | string | Tool name (for tools/call) |
+| `args` | object | Tool arguments (SHOULD be redacted) |
+| `failed_arg` | string | Argument that failed validation |
+| `failed_rule` | string | Regex pattern that failed |
+
+### 6.3 Example
+
+```json
+{
+  "timestamp": "2026-01-20T10:30:45.123Z",
+  "direction": "upstream",
+  "method": "tools/call",
+  "tool": "delete_file",
+  "args": {"path": "/etc/passwd"},
+  "decision": "BLOCK",
+  "policy_mode": "enforce",
+  "violation": true,
+  "failed_arg": "path",
+  "failed_rule": "^/home/.*"
+}
+```
+
+### 6.4 DLP Events
+
+DLP redaction events SHOULD be logged separately:
+
+```json
+{
+  "timestamp": "2026-01-20T10:30:45.123Z",
+  "direction": "downstream",
+  "event": "DLP_TRIGGERED",
+  "dlp_rule": "AWS Key",
+  "dlp_action": "REDACTED",
+  "dlp_match_count": 2
+}
+```
+
+---
+
+## 7. Conformance
+
+### 7.1 Conformance Levels
+
+| Level | Requirements |
+|-------|--------------|
+| **Basic** | Method authorization, tool allowlist, error codes |
+| **Full** | Basic + argument validation, rate limiting, DLP, audit logging |
+| **Extended** | Full + Human-in-the-Loop (action=ask) |
+
+### 7.2 Conformance Testing
+
+Implementations MUST pass the conformance test suite to claim AIP compliance.
+
+The test suite consists of:
+1. **Schema validation tests**: Verify policy parsing
+2. **Decision tests**: Input → expected decision
+3. **Normalization tests**: Verify Unicode handling
+4. **Error format tests**: Verify JSON-RPC errors
+
+See `spec/conformance/` for test vectors.
+
+### 7.3 Implementation Requirements
+
+Implementations MUST:
+- Parse `apiVersion: aip.io/v1alpha1` documents
+- Reject documents with unknown `apiVersion`
+- Apply NFKC normalization to names
+- Return specified error codes
+- Support `enforce` and `monitor` modes
+
+Implementations SHOULD:
+- Log decisions in the specified format
+- Support DLP scanning
+- Support rate limiting
+
+Implementations MAY:
+- Use any regex engine with RE2 semantics
+- Implement additional security features (egress control, sandboxing)
+
+---
+
+## 8. Security Considerations
+
+### 8.1 Policy File Protection
+
+The policy file itself MUST be protected from modification by the agent. Implementations MUST automatically add the policy file path to `protected_paths`.
+
+### 8.2 Regex Denial of Service (ReDoS)
+
+Implementations MUST use a regex engine that guarantees linear-time matching (RE2 or equivalent). Pathological patterns like `(a+)+$` MUST NOT cause exponential execution time.
+
+### 8.3 Unicode Normalization
+
+Implementations MUST apply NFKC normalization to prevent homoglyph attacks. However, implementers should be aware that NFKC does not normalize all visually similar characters (e.g., Cyrillic 'а' vs Latin 'a').
+
+### 8.4 Monitor Mode Risks
+
+Monitor mode allows all requests through. Implementations SHOULD warn users when monitor mode is enabled in production environments.
+
+### 8.5 Audit Log Integrity
+
+Audit logs SHOULD be written to a location not writable by the agent. Implementations MAY support log signing or forwarding to external systems.
+
+---
+
+## 9. IANA Considerations
+
+This specification requests registration of the following:
+
+### 9.1 Media Type
+
+- Type name: application
+- Subtype name: vnd.aip.policy+yaml
+- Required parameters: None
+- File extension: .yaml, .yml
+
+### 9.2 URI Scheme
+
+This specification uses the `aip.io` namespace for versioning:
+- `aip.io/v1alpha1` - This specification
+
+---
+
+## Appendix A: Complete Schema Reference
+
+```yaml
+# Complete AgentPolicy schema
+
+apiVersion: aip.io/v1alpha1      # REQUIRED
+kind: AgentPolicy                 # REQUIRED
+
+metadata:                         # REQUIRED
+  name: string                    # REQUIRED - Policy identifier
+  version: string                 # OPTIONAL - Semantic version
+  owner: string                   # OPTIONAL - Contact email
+
+spec:                             # REQUIRED
+  mode: enforce | monitor         # OPTIONAL, default: enforce
+  
+  allowed_tools:                  # OPTIONAL
+    - string
+  
+  allowed_methods:                # OPTIONAL
+    - string
+  
+  denied_methods:                 # OPTIONAL
+    - string
+  
+  protected_paths:                # OPTIONAL
+    - string
+  
+  strict_args_default: boolean    # OPTIONAL, default: false
+  
+  tool_rules:                     # OPTIONAL
+    - tool: string                # REQUIRED
+      action: allow|block|ask     # OPTIONAL, default: allow
+      rate_limit: string          # OPTIONAL, format: "N/period"
+      strict_args: boolean        # OPTIONAL
+      allow_args:                 # OPTIONAL
+        <arg_name>: <regex>
+  
+  dlp:                            # OPTIONAL
+    enabled: boolean              # OPTIONAL, default: true
+    detect_encoding: boolean      # OPTIONAL, default: false
+    filter_stderr: boolean        # OPTIONAL, default: false
+    patterns:                     # REQUIRED if dlp present
+      - name: string              # REQUIRED
+        regex: string             # REQUIRED
+```
+
+---
+
+## Appendix B: Changelog
+
+### v1alpha1 (2026-01-20)
+
+- Initial draft specification
+- Defined core policy schema
+- Defined evaluation semantics
+- Defined error codes
+- Defined audit log format
+
+---
+
+## Appendix C: References
+
+- [Model Context Protocol (MCP)](https://modelcontextprotocol.io/)
+- [JSON-RPC 2.0 Specification](https://www.jsonrpc.org/specification)
+- [RFC 2119 - Key words for use in RFCs](https://www.rfc-editor.org/rfc/rfc2119)
+- [Unicode NFKC Normalization](https://unicode.org/reports/tr15/)
+- [RE2 Syntax](https://github.com/google/re2/wiki/Syntax)
+
+---
+
+## Appendix D: Future Extensions
+
+This appendix describes features under consideration for future versions of AIP.
+
+### D.1 Network Egress Control
+
+**Status:** Proposed for v1beta1
+
+#### Motivation
+
+Tool-level authorization prevents agents from calling dangerous tools, but a compromised or malicious MCP server can still exfiltrate data through:
+- Outbound HTTP requests embedded in tool implementations
+- DNS exfiltration
+- Covert channels in allowed network traffic
+
+Egress control would allow policies to restrict which network destinations an MCP server (or its subprocesses) can reach.
+
+#### Proposed Schema Extension
+
+```yaml
+apiVersion: aip.io/v1beta1  # Future version
+kind: AgentPolicy
+metadata:
+  name: egress-example
+spec:
+  # ... existing fields ...
+  
+  egress:
+    mode: block | allow | monitor     # Default: allow (no restriction)
+    
+    allowed_hosts:
+      - "api.github.com"
+      - "*.openai.com"
+      - "10.0.0.0/8"                   # CIDR notation
+    
+    denied_hosts:
+      - "*.ngrok.io"
+      - "*.requestbin.com"
+    
+    allowed_ports:
+      - 443
+      - 80
+    
+    denied_ports:
+      - 22
+      - 3389
+```
+
+#### Implementation Considerations
+
+Egress control is inherently platform-specific:
+
+| Platform | Mechanism | Limitations |
+|----------|-----------|-------------|
+| **Linux** | eBPF, seccomp-bpf, network namespaces | Requires CAP_BPF or root |
+| **macOS** | Network Extension, sandbox-exec | Requires entitlements |
+| **Windows** | Windows Filtering Platform (WFP) | Requires admin |
+| **Container** | `--network=none`, network policies | Requires container runtime |
+| **Cross-platform** | DNS-based filtering, HTTP proxy | Bypassable, incomplete |
+
+Implementations MAY support egress control through any mechanism appropriate for their platform. The specification will define the **policy schema** and **expected behavior**, not the enforcement mechanism.
+
+#### Open Questions
+
+1. Should egress rules be per-tool or global?
+2. How to handle DNS resolution (allow DNS but block resolved IP)?
+3. Should there be a "learning mode" to auto-generate allowlists?
+4. How to handle localhost connections (MCP servers often bind locally)?
+
+### D.2 Identity Federation
+
+**Status:** Under Discussion
+
+Allow policies to reference external identity providers:
+
+```yaml
+spec:
+  identity:
+    provider: "oidc"
+    issuer: "https://accounts.google.com"
+    required_claims:
+      email_verified: true
+      hd: "company.com"
+```
+
+### D.3 Policy Inheritance
+
+**Status:** Under Discussion
+
+Allow policies to extend base policies:
+
+```yaml
+apiVersion: aip.io/v1beta1
+kind: AgentPolicy
+metadata:
+  name: team-policy
+spec:
+  extends: "org-base-policy"  # Inherit from another policy
+  allowed_tools:
+    - additional_tool          # Add to parent's list
+```
+
+### D.4 Telemetry and Metrics
+
+**Status:** Under Discussion
+
+Standardized metrics export for observability:
+
+```yaml
+spec:
+  telemetry:
+    metrics:
+      endpoint: "http://prometheus:9090/metrics"
+      format: "prometheus"
+    traces:
+      endpoint: "http://jaeger:14268/api/traces"
+      format: "otlp"
+```
+
+---
+
+## Appendix E: Implementation Notes
+
+This appendix provides guidance for implementers.
+
+### E.1 Reference Implementation
+
+The reference implementation is available at:
+https://github.com/ArangoGutierrez/agent-identity-protocol
+
+It provides:
+- Go-based proxy (`aip-proxy`)
+- Policy engine (`pkg/policy`)
+- DLP scanner (`pkg/dlp`)
+- Audit logger (`pkg/audit`)
+
+### E.2 Testing Against Conformance Suite
+
+```bash
+# Clone the spec repository
+git clone https://github.com/ArangoGutierrez/agent-identity-protocol
+
+# Run conformance tests against your implementation
+cd agent-identity-protocol/spec/conformance
+./run-tests.sh --impl "your-aip-binary"
+```
+
+### E.3 Registering Your Implementation
+
+Implementations that pass the conformance suite may be listed in the official registry. Submit a PR to the AIP repository with:
+- Implementation name and URL
+- Conformance level achieved (Basic/Full/Extended)
+- Platform support matrix

@@ -1,0 +1,152 @@
+---
+title: "Identity Workflow"
+---
+
+Below is the proposed workflow for AIP in action.
+
+## Agent Registration
+
+```
+1. Agent generates cryptographic key pair
+
+2. Agent → Registry
+   POST /v1/agents/register
+   
+   Request Body:
+   {
+     "identity": {
+       "name": "customer_support_agent",
+       "type": "autonomous_agent",
+       "created_by": "joe",
+       "organization_id": "acme123"
+     },
+     "provenance": {
+       "framework": "langchain", // do we need?
+       "model": "latest-model",
+       "build_environment": "production",
+	   "code_hash": ABCD,
+     },
+     "capabilities": [
+       "read:customer_tickets",
+       "write:email_responses"
+     ]
+     "public_key": "<key>",
+   }
+
+3. Registry validates:
+   - Public key format and algorithm
+   - Proof of private key possession (signature verification)
+   - Organization exists and has capacity
+   - Capabilities align with org policies
+   - Code hash is unique (prevents duplicate registrations)
+
+4. Registry → Agent
+   Response returns certificate for agent.
+   {
+     "agent_id": "1234567",
+     "version": "1.0.0",
+     "status": "registered",
+     "registry_url": "https://registry.viewagents.ai",
+     "attestation_certificate": "-----BEGIN CERTIFICATE-----\nMIIC...",
+     "created_at": "2026-02-09"
+   }
+
+5. Agent stores:
+   - agent_id
+   - Private key (encrypted at rest)
+   - Attestation cert
+   - Issuer public key for verification
+```
+
+## Token Authentication
+
+```
+1. Agent needs to call an API
+
+2. Agent → Token Issuer
+   POST /v1/auth/token
+  
+   
+   Request Body:
+   {
+     "agent_id": "abc123",
+     "requested_scope": ["read:customer_tickets"],
+     "context": {
+       "task_id": "task_resolve_ticket_12345",
+       "target_system": "company_api",
+     },
+     "ttl": 3600
+   }
+
+3. Token Issuer validates:
+   - Agent signature using stored public key
+   - Agent is not revoked
+   - Requested scope ⊆ agent capabilities
+   - TTL ≤ agent max_token_lifetime
+   - Context satisfies organizational policies
+   - Agent hasn't exceeded rate limits
+
+4. Token Issuer → Agent
+   Response (200 OK):
+   {
+     "access_token": "abcde",
+     "expires_in": 3600,
+     "scope": ["read:customer_tickets"],
+     "issued_at": "2026-02-11T11:00:00Z",
+   }
+
+5. Agent stores token in memory (never disk for security)
+
+6. Token Issuer logs audit event:
+   {
+     "event_type": "token_issued",
+     "agent_id": "abc123",
+     "scope": ["read:customer_tickets"],
+     "context": {...},
+     "timestamp": "2026-02-11"
+   }
+```
+
+## Token Verification
+
+```
+1. Agent → Resource Server (same as above)
+
+2. Resource Server → Token Issuer
+   POST /v1/auth/verify
+   
+   Request Body:
+   {
+     "token": "abc....",
+     "required_scope": ["read:customer_tickets"],
+     "resource_context": {
+       "resource_type": "customer_ticket",
+       "resource_id": "12345",
+       "data_classification": "pii",
+       "geographic_location": "us-east"
+     }
+   }
+
+3. Token Issuer validates:
+   - All local checks (signature, expiration, scope)
+   - Token not revoked (authoritative check)
+   - Context matches agent constraints (data_residency, etc.)
+   - Real-time policy evaluation (new policies since token issued)
+
+4. Token Issuer → Resource Server
+   Response (200 OK):
+   {
+     "valid": true,
+     "agent_id": "abc123",
+     "agent_name": "customer_support_agent",
+     "agent_version": "1.0.0",
+     "scope": ["read:customer_tickets"],
+     "expires_at": "2026-02-06T12:00:00Z",
+     "trust_level": "verified",
+     "code_hash": "sha256:a3f5b8c9d2e1...",
+     "constraints_satisfied": true,
+     "warnings": []
+   }
+
+5. Resource Server proceeds with authorization decision
+```

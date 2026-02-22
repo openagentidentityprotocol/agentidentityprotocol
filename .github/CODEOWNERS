@@ -4,16 +4,6 @@
 # Default owner for everything
 * @openagentidentityprotocol/OAIP-Collaborators  
 
-# Core proxy implementation
-/proxy/cmd/ @openagentidentityprotocol/OAIP-Collaborators
-/proxy/pkg/ @openagentidentityprotocol/OAIP-Collaborators
-
-# Policy engine (security-critical)
-/proxy/pkg/policy/ @openagentidentityprotocol/OAIP-Collaborators
-
-# DLP scanner (security-critical)
-/proxy/pkg/dlp/ @openagentidentityprotocol/OAIP-Collaborators
-
 # Security documentation
 /SECURITY.md @openagentidentityprotocol/OAIP-Collaborators
 /.github/SECURITY/ @openagentidentityprotocol/OAIP-Collaborators

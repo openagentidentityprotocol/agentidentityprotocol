@@ -44,6 +44,12 @@
                   "specs/aip-v1alpha3"
                 ]
               },
+              {
+                "group": "IETF Standardization",
+                "pages": [
+                  "ietf/ietf-draft-00"
+                ]
+              },
               "faq"
             ]
           },

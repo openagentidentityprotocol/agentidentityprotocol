@@ -31,7 +31,7 @@ interface Delegation {
   currentDepth: number        // Current depth in the chain (0 = root)
   expiresAt: string           // ISO 8601 expiration timestamp
   createdAt: string           // ISO 8601 creation timestamp
-  parentDelegationId?: string // ID of parent delegation (null for root)
+  parentDelegationId: string | null // ID of parent delegation (null for root)
   revoked: boolean            // Revocation status
   revokedAt?: string          // ISO 8601 revocation timestamp
   revokedReason?: string      // Human-readable revocation reason

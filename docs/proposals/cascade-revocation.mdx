@@ -1,0 +1,133 @@
+---
+title: "Cascade Revocation for Agent Delegation Chains"
+description: "Proposal for propagating revocation through agent delegation trees"
+---
+
+## Problem
+
+When agents delegate authority to other agents, revocation must propagate. If Agent A delegates to Agent B, and B sub-delegates to C, revoking A→B must also invalidate C's authority. Without cascade revocation, revoking a compromised agent leaves its downstream delegations active.
+
+In multi-agent systems where agents autonomously sub-delegate to specialists, a single compromised delegation can create an unbounded tree of active permissions that the human principal cannot recall.
+
+## Data Structures
+
+All data structures are defined in [cascade-revocation.schema.json](/spec/schema/cascade-revocation.schema.json).
+
+The core objects are:
+
+- **Delegation** — authority granted from one agent to another, with scope, spend limit, depth limit, and expiry
+- **RevocationRecord** — signed proof that a delegation was revoked, including cascade count
+- **ChainRegistry** — parent-child index populated at delegation creation time (not reconstructed at revocation time)
+- **RevocationEvent** — event emitted for each revoked delegation in a cascade
+
+The `parentDelegationId` field uses `string | null` (not optional). Root delegations set this to `null` explicitly. This aligns with the ChainRegistry.parents map behavior.
+
+## Algorithm
+
+### Cascade Revocation
+
+When a delegation is revoked, all downstream delegations MUST be revoked synchronously.
+
+```
+cascadeRevoke(delegationId, reason, revokerKey):
+  1. Look up delegation in store
+  2. If already revoked, return (idempotent)
+  3. Mark delegation as revoked (revoked=true, revokedAt, reason)
+  4. Sign revocation record with revokerKey
+  5. Get all children from chain registry
+  6. For each child: recursively cascadeRevoke(child, reason, revokerKey)
+  7. Emit revocation event
+  8. Return RevocationRecord with cascadeCount
+```
+
+**Properties:**
+- **Synchronous** — all descendants revoked in the same operation. No eventual consistency.
+- **Deterministic** — same input always produces the same result.
+- **Idempotent** — revoking an already-revoked delegation is a no-op.
+- **Total** — no partial cascade. All descendants revoked or operation fails atomically.
+
+### Batch Revocation by Agent
+
+Revoke all delegations granted TO a specific agent, with cascade.
+
+```
+batchRevokeByAgent(agentId, reason, revokerKey):
+  1. Find all delegations where delegateId == agentId
+  2. For each: cascadeRevoke(delegation, reason, revokerKey)
+  3. Return list of RevocationRecords
+```
+
+Use case: an agent is compromised. The principal revokes everything granted to that agent. All sub-delegations also die.
+
+### Chain Validation
+
+Before any action is permitted, the entire delegation chain back to the principal MUST be validated.
+
+```
+validateChain(delegationIds[]):
+  1. For each delegation in chain:
+     - If revoked: return invalid
+     - If expired: return invalid
+     - If not in registry: return invalid
+  2. For each adjacent pair (parent, child):
+     - If parent.delegateId != child.delegatorId: return invalid
+  3. Return valid
+```
+
+## Sub-delegation Constraints
+
+When an agent sub-delegates, the child MUST be strictly narrower than the parent:
+
+- **Scope** — child scope MUST be a subset of parent scope
+- **Spend limit** — child MUST NOT exceed parent spend limit
+- **Depth** — child currentDepth MUST equal parent currentDepth + 1, MUST NOT exceed parent maxDepth
+- **Expiry** — child MUST NOT exceed parent expiration
+
+Violation of any constraint MUST cause sub-delegation to fail.
+
+## Security Properties
+
+| Property | Requirement |
+|----------|------------|
+| No orphan delegations | Every non-root delegation MUST have a traceable parent |
+| Idempotent revocation | Double-revoke MUST NOT re-emit events or increment counts |
+| Irreversible | Revoked delegations CANNOT be un-revoked |
+| Branching | Cascade MUST traverse all branches of multi-child delegations |
+| Event propagation | Implementations SHOULD support revocation event subscriptions |
+
+## Integration with Policy Engines
+
+Cascade revocation is an identity-layer primitive. Policy engines (such as AIP's AgentPolicy) SHOULD reference delegation chain validity as a precondition for policy evaluation.
+
+```
+1. Agent presents action request with delegationId
+2. Policy engine calls validateChain() on the delegation chain
+3. If chain invalid (any link revoked/expired), deny immediately
+4. If chain valid, proceed to policy evaluation
+```
+
+This ensures revocation takes effect immediately without requiring policy engines to maintain their own revocation state.
+
+## Adversarial Scenarios
+
+Any conforming implementation MUST mitigate the following:
+
+| Attack | Mitigation |
+|--------|-----------|
+| Replay revoked delegation | Chain validation checks revoked flag before any action |
+| Sub-delegate after revocation | Sub-delegation checks delegation validity |
+| Scope escalation via sub-delegation | Strict scope narrowing enforced |
+| Spend limit escalation | Child spend limit capped at parent |
+| Depth bomb (unbounded sub-delegation) | maxDepth enforced at sub-delegation time |
+| Double-revoke event spam | Idempotent revocation |
+| Orphan delegation after parent delete | Cascade revocation before deletion |
+
+## Scope Resolution
+
+Cascade revocation depends on correct scope matching. All implementations MUST use a single scope matching function:
+
+- Exact match: `code` covers `code`
+- Hierarchical: `code` covers `code:deploy`
+- Universal wildcard: `*` covers everything
+- Prefix wildcard: `commerce:*` covers `commerce` and `commerce:checkout`
+- No reverse: `code:deploy` does NOT cover `code`

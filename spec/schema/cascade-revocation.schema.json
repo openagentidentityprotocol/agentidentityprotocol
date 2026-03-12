@@ -30,10 +30,14 @@
           "minItems": 1,
           "description": "Permitted action scopes"
         },
+        "currency": {
+          "type": "string",
+          "description": "Delegation currency (ISO 4217 code, e.g. 'USD'). If omitted, protocol default applies"
+        },
         "spendLimit": {
           "type": "number",
           "minimum": 0,
-          "description": "Maximum spend in delegation currency"
+          "description": "Maximum spend in smallest unit of currency (e.g. cents). If omitted, no spend constraint"
         },
         "maxDepth": {
           "type": "integer",

@@ -30,12 +30,12 @@ When a delegation is revoked, all downstream delegations MUST be revoked synchro
 
 ```
 cascadeRevoke(delegationId, reason, revokerKey):
-  1. Look up delegation in store
+  1. Look up delegation in store by delegationId
   2. If already revoked, return (idempotent)
   3. Mark delegation as revoked (revoked=true, revokedAt, reason)
   4. Sign revocation record with revokerKey
-  5. Get all children from chain registry
-  6. For each child: recursively cascadeRevoke(child, reason, revokerKey)
+  5. Get all child delegationIds from chain registry
+  6. For each childId: recursively cascadeRevoke(childId, reason, revokerKey)
   7. Emit revocation event
   8. Return RevocationRecord with cascadeCount
 ```
@@ -44,7 +44,7 @@ cascadeRevoke(delegationId, reason, revokerKey):
 - **Synchronous** — all descendants revoked in the same operation. No eventual consistency.
 - **Deterministic** — same input always produces the same result.
 - **Idempotent** — revoking an already-revoked delegation is a no-op.
-- **Total** — no partial cascade. All descendants revoked or operation fails atomically.
+- **Total (Transactional)** — no partial cascade. Either all descendants are revoked and their revocation records durably persisted, or none are. Implementations MUST execute steps 3-7 for the entire cascade within a single atomic transaction or equivalent mechanism that guarantees all-or-nothing visibility. In systems without multi-record transactions, implementations MUST document that cascade is best-effort and may leave partial state on failure.
 
 ### Batch Revocation by Agent
 
@@ -65,12 +65,17 @@ Before any action is permitted, the entire delegation chain back to the principa
 
 ```
 validateChain(delegationIds[]):
-  1. For each delegation in chain:
+  0. Resolve delegations from registry:
+     - For each delegationId in delegationIds (in order provided):
+       - Lookup delegation in registry by delegationId
+       - If not found: return invalid ("unknown delegation")
+       - Append to orderedDelegations[]
+  1. For each delegation in orderedDelegations:
      - If revoked: return invalid
      - If expired: return invalid
-     - If not in registry: return invalid
-  2. For each adjacent pair (parent, child):
-     - If parent.delegateId != child.delegatorId: return invalid
+  2. For each adjacent pair (parent, child) in orderedDelegations:
+     - If parent.delegationId != child.parentDelegationId: return invalid ("invalid parent reference")
+     - If parent.delegateId != child.delegatorId: return invalid ("chain break")
   3. Return valid
 ```
 
@@ -78,8 +83,8 @@ validateChain(delegationIds[]):
 
 When an agent sub-delegates, the child MUST be strictly narrower than the parent:
 
-- **Scope** — child scope MUST be a subset of parent scope
-- **Spend limit** — child MUST NOT exceed parent spend limit
+- **Scope** — child scope MUST be a subset of parent scope. For array-valued scopes: for each `requiredScope` in the child's scope array, there MUST exist some `grantedScope` in the parent's scope array such that `scopeCovers(grantedScope, requiredScope)` is true, where `scopeCovers` operates on individual scope strings.
+- **Spend limit** — child MUST NOT exceed parent spend limit. Currency is explicit (ISO 4217) or inherited from protocol default.
 - **Depth** — child currentDepth MUST equal parent currentDepth + 1, MUST NOT exceed parent maxDepth
 - **Expiry** — child MUST NOT exceed parent expiration
 
